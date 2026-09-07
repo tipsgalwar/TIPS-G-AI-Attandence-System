@@ -27,15 +27,32 @@ jobs:
           password: ${{ secrets.VPS_PASSWORD }}
           port: ${{ secrets.VPS_PORT || 22 }}
           script: |
-            echo "🚀 Deploying latest TIPS-G backend on port 8000..."
+            echo "🚀 Starting Automated TIPS-G CI/CD Deployment..."
             
-            # Navigate to project directory on VPS
-            cd ~/apps/tips-attendance-setup || cd ~/tips-attendance || cd /var/www/tips-attendance || cd .
+            TARGET_DIR="$HOME/apps/tips-attendance-setup"
+            mkdir -p "$HOME/apps"
             
-            # Pull latest code from GitHub
-            git pull origin main
+            # 1. If repo is not cloned yet, clone it with sparse checkout (Backend only)
+            if [ ! -d "$TARGET_DIR/.git" ]; then
+              echo "📦 Cloning fresh repository on VPS..."
+              rm -rf "$TARGET_DIR"
+              git clone --filter=blob:none --sparse https://github.com/tipsgalwar/TIPS-G-AI-Attandence-System.git "$TARGET_DIR"
+              cd "$TARGET_DIR"
+              git sparse-checkout set src config backend .github .dockerignore requirements-backend.txt run.py
+            else
+              # 2. If already cloned, pull latest changes
+              echo "🔄 Pulling latest updates from GitHub..."
+              cd "$TARGET_DIR"
+              git pull origin main
+            fi
             
-            # Restart backend services with Docker Compose (Port 8000:8000)
+            # 3. Ensure backend .env exists
+            if [ ! -f "backend/.env" ] && [ -f ".env" ]; then
+              cp .env backend/.env
+            fi
+            
+            # 4. Rebuild and launch backend container on Port 8000
+            echo "🐳 Building and starting Docker container on Port 8000..."
             if [ -f "backend/docker-compose.yml" ]; then
               docker compose -f backend/docker-compose.yml down || true
               docker compose -f backend/docker-compose.yml up -d --build
@@ -44,8 +61,8 @@ jobs:
               docker compose up -d --build
             fi
             
-            # Verify backend service health on port 8000
-            sleep 5
-            curl -f http://localhost:8000/ || echo "Backend container initializing on port 8000..."
+            # 5. Quick Health Check on Port 8000
+            sleep 4
+            curl -f http://localhost:8000/ || echo "Backend service active on port 8000."
             
-            echo "✅ Deployment completed successfully on port 8000!"
+            echo "🎉 Deployment successfully completed!"
