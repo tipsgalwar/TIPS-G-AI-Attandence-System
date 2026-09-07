@@ -1,0 +1,27 @@
+ai_models:
+  # Models Selection (ONNX / local runtime)
+  detector_backend: "mediapipe"
+  recognition_model: "ArcFace"
+  distance_metric: "cosine"
+  similarity_threshold: 0.40  # Cosine distance threshold (strict single-identity match <= 0.40)
+  minimum_confidence: 60.0    # Minimum confidence % required (>= 60% prevents lookalikes and impostors)
+  duplicate_threshold: 0.49  # Cosine distance threshold for duplicate face rejection (distance <= 0.49 blocks same person)
+  
+  onnx:
+    arcface_model_path: "models/arcface_resnet50.onnx"
+    retinaface_model_path: "models/retinaface_resnet50.onnx"
+
+  # Anti-Spoofing & Liveness
+  liveness:
+    enabled: true
+    blink_detection:
+      enabled: true
+      ear_threshold: 0.20       # Eye Aspect Ratio threshold for blink
+      consecutive_frames: 2     # Minimum consecutive frames below threshold
+      required_blinks: 1        # Required blinks during verification session
+    head_movement:
+      enabled: true
+      yaw_threshold: 15.0       # Minimum degrees of yaw deviation required
+      pitch_threshold: 10.0     # Minimum degrees of pitch deviation required
+    eye_tracking:
+      enabled: false            # Extended feature for gaze vector analysis

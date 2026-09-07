@@ -1,0 +1,41 @@
+# Git and environment files
+.git/
+.gitignore
+.env
+.env.*
+.venv/
+venv/
+env/
+
+# Python caches and artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Frontend desktop client files & packaging
+frontend/
+run_frontend.py
+config.ini
+requirements-frontend.txt
+requirements.txt
+frontend.spec
+Launch-TIPS-G.bat
+create_shortcut.py
+tipsg_installer.iss
+PRIVACY_POLICY.md
+sync_backend.py
+scripts/
+*.ico
+
+# Heavy AI model weights & desktop assets
+models/
+
+# Local data / logs / temporary files
+storage/
+logs/
+.DS_Store
+*.log

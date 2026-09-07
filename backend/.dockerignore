@@ -1,0 +1,33 @@
+# Git and environment files
+.git/
+.gitignore
+.env
+.env.*
+.venv/
+venv/
+env/
+
+# Python caches and artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Desktop client, packaging, & docs (in case any are placed in backend)
+frontend/
+run_frontend.py
+config.ini
+requirements-frontend.txt
+*.spec
+*.iss
+*.md
+*.ico
+
+# Storage and logs
+storage/
+logs/
+.DS_Store
+*.log

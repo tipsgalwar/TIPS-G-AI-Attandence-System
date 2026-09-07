@@ -1,0 +1,9 @@
+system:
+  host: "127.0.0.1"
+  port: 8000
+  debug: true
+  storage_dir: "storage"
+  log_level: "INFO"
+  jwt_secret: "supersecretkeychangeinproduction"
+  jwt_algorithm: "HS256"
+  access_token_expire_minutes: 1440 # 24 hours

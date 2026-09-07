@@ -1,0 +1,12 @@
+attendance:
+  # Check-in policy
+  start_time: "10:30:00"
+  late_threshold_minutes: 0     # Late after 10:30
+  absent_threshold_minutes: 60  # Absent after 11:30 if no check-in
+  
+  # Scan schedules
+  daily_summary_time: "18:00:00" # Runs summary generator & alerts at 6 PM
+  
+  # Alert triggers
+  consecutive_absent_days_trigger: 3
+  notify_parents_on_absence: true

@@ -1,0 +1,24 @@
+notifications:
+  # General switches
+  enable_email: true
+  enable_whatsapp: true
+  enable_push: true
+
+  # Email Configuration (SMTP)
+  email:
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+    sender_email: "tipsgalwar@gmail.com"
+    sender_password: "mockpasswordchange"
+    use_tls: true
+
+  # WhatsApp Configuration (Twilio API)
+  whatsapp:
+    account_sid: "ACXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+    auth_token: "your_auth_token_here"
+    from_number: "whatsapp:+14155238886" # Twilio Sandbox Number
+    institution_name: "TIPS-G Alwar"
+
+  # Push Notification Mock Configuration
+  push:
+    firebase_cred_path: "config/firebase_credentials.json"

@@ -1,0 +1,110 @@
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+.venv/
+ENV/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Logs
+logs/
+*.log
+
+# Database (local/dev only)
+storage/student_guardian.db
+storage/student_guardian.db-shm
+storage/student_guardian.db-wal
+
+# Local storage files (keep structure, ignore content)
+storage/students/*/.DS_Store
+storage/documents/*/.DS_Store
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Build artifacts
+*.whl
+*.tar.gz
+
+# Cache
+.cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# IDE temporary files
+*.sublime-workspace
+*.sublime-project
+
+# AI & Face Models (Large binary weights - auto-downloaded on setup/startup)
+models/*.onnx
+models/*.task
+models/*.pt
+models/*.bin
+models/*.weights
+!models/download_models.py
+!models/README.md
+!models/.gitkeep
+
+# Installer and Distribution Artifacts
+dist_installer/
+*.exe
+*.token
+student_session.token
+

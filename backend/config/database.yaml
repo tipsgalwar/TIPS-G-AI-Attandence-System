@@ -1,0 +1,13 @@
+database:
+  # 'sqlite' or 'postgresql'
+  type: "postgresql"
+
+  sqlite:
+    db_path: "storage/student_guardian.db"
+
+  postgresql:
+    host: "db.ssygbaikowifdrmtoqoz.supabase.co"
+    port: 5432
+    name: "postgres"
+    user: "postgres"
+    password: "tipsgsupabase"

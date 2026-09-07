@@ -1,0 +1,22 @@
+# TIPS-G ALWAR Student Attendance System — Production Frontend Requirements
+# For PyQt6 Desktop Application, Camera Stream & Edge AI Face Verification
+
+# Desktop GUI Framework
+PyQt6>=6.6.1
+
+# AI, Face Recognition, Liveness & Computer Vision
+opencv-python>=4.9.0.80
+mediapipe>=0.10.11
+onnxruntime>=1.17.0
+numpy>=1.26.4
+
+# API Communication & Real-time WebSockets
+requests>=2.31.0
+websocket-client>=1.8.0
+
+# Configuration & Logging
+loguru>=0.7.2
+python-dotenv>=1.0.0
+
+# Desktop Packaging & Bundling
+pyinstaller>=6.4.0
