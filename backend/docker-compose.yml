@@ -17,8 +17,8 @@ services:
     ports:
       - "8000:8000"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
-      interval: 30s
-      timeout: 10s
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8000/ || exit 1"]
+      interval: 15s
+      timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 15s
