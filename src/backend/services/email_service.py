@@ -1,5 +1,6 @@
 import os
 import smtplib
+import requests
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from loguru import logger
@@ -11,6 +12,9 @@ load_dotenv()
 class EmailService:
     def __init__(self):
         self.enabled = os.getenv("EMAIL_ENABLED", "true").lower() == "true"
+        self.resend_api_key = os.getenv("RESEND_API_KEY", "").strip()
+        self.resend_from = os.getenv("RESEND_FROM_EMAIL", os.getenv("EMAIL_FROM", "TIPS-G ALWAR <onboarding@resend.dev>")).strip()
+        # Fallback SMTP settings
         self.host = os.getenv("EMAIL_HOST", "smtp.gmail.com")
         self.port = int(os.getenv("EMAIL_PORT", "587"))
         self.username = os.getenv("EMAIL_USERNAME", "")
@@ -22,37 +26,66 @@ class EmailService:
             logger.info(f"Email service disabled. Skipping email to {to_email}")
             return False
 
-        if not self.username or not self.password:
-            logger.error("Email credentials not configured. Cannot send email.")
-            return False
-            
         if not to_email or "@" not in to_email or "." not in to_email:
             logger.warning(f"Skipping email dispatch: '{to_email}' is not a valid recipient email address.")
             return False
 
-        if html_body:
-            msg = MIMEMultipart("alternative")
-            msg.attach(MIMEText(body, "plain"))
-            msg.attach(MIMEText(html_body, "html"))
-        else:
-            msg = MIMEMultipart()
-            msg.attach(MIMEText(body, "plain"))
+        # 1. Primary Method: Resend REST API (Ultra-fast & reliable HTTP dispatch)
+        if self.resend_api_key:
+            try:
+                from_addr = self.resend_from if "<" in self.resend_from else f"TIPS-G ALWAR <{self.resend_from}>"
+                payload = {
+                    "from": from_addr,
+                    "to": [to_email],
+                    "subject": subject,
+                    "text": body,
+                }
+                if html_body:
+                    payload["html"] = html_body
 
-        msg["From"] = f"{self.from_email} <{self.username}>" if self.from_email and self.from_email != self.username else self.username
-        msg["To"] = to_email
-        msg["Subject"] = subject
+                headers = {
+                    "Authorization": f"Bearer {self.resend_api_key}",
+                    "Content-Type": "application/json"
+                }
 
-        try:
-            server = smtplib.SMTP(self.host, self.port)
-            server.starttls()
-            server.login(self.username, self.password)
-            server.send_message(msg)
-            server.quit()
-            logger.info(f"Successfully sent email to {to_email}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to send email to {to_email}: {e}")
-            return False
+                response = requests.post("https://api.resend.com/emails", json=payload, headers=headers, timeout=10)
+                if response.status_code in [200, 201]:
+                    res_json = response.json()
+                    logger.info(f"✓ Resend successfully sent email to {to_email} (ID: {res_json.get('id')})")
+                    return True
+                else:
+                    logger.error(f"Resend API error ({response.status_code}): {response.text}")
+            except Exception as resend_err:
+                logger.error(f"Failed sending email via Resend API: {resend_err}")
+
+        # 2. Fallback to SMTP if Resend is not configured or fails
+        if self.username and self.password:
+            try:
+                if html_body:
+                    msg = MIMEMultipart("alternative")
+                    msg.attach(MIMEText(body, "plain"))
+                    msg.attach(MIMEText(html_body, "html"))
+                else:
+                    msg = MIMEMultipart()
+                    msg.attach(MIMEText(body, "plain"))
+
+                msg["From"] = f"{self.from_email} <{self.username}>" if self.from_email and self.from_email != self.username else self.username
+                msg["To"] = to_email
+                msg["Subject"] = subject
+
+                server = smtplib.SMTP(self.host, self.port, timeout=10)
+                server.starttls()
+                server.login(self.username, self.password)
+                server.send_message(msg)
+                server.quit()
+                logger.info(f"Successfully sent email via SMTP to {to_email}")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to send email via SMTP to {to_email}: {e}")
+                return False
+
+        logger.error("No valid email credentials found (Neither Resend API key nor SMTP configured).")
+        return False
 
     def send_registration_email(self, to_email: str, student_name: str, username: str, password: str):
         subject = "Welcome to TIPS-G: Your Student Account Details"

@@ -1,0 +1,47 @@
+name: Deploy Backend to VPS
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'dist/**'
+      - 'dist_installer/**'
+
+jobs:
+  deploy:
+    name: Deploy to Production VPS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Execute Remote SSH Commands on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USERNAME }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          password: ${{ secrets.VPS_PASSWORD }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          script: |
+            echo "🚀 Deploying latest TIPS-G backend..."
+            
+            # Navigate to project directory on VPS
+            cd ~/apps/tips-attendance-setup || cd ~/tips-attendance || cd /var/www/tips-attendance || cd .
+            
+            # Pull latest code from GitHub
+            git pull origin main
+            
+            # Restart backend services with Docker Compose
+            if [ -f "backend/docker-compose.yml" ]; then
+              docker compose -f backend/docker-compose.yml down || true
+              docker compose -f backend/docker-compose.yml up -d --build
+            elif [ -f "docker-compose.yml" ]; then
+              docker compose down || true
+              docker compose up -d --build
+            fi
+            
+            echo "✅ Deployment completed successfully!"
