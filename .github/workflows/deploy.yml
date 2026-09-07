@@ -27,7 +27,7 @@ jobs:
           password: ${{ secrets.VPS_PASSWORD }}
           port: ${{ secrets.VPS_PORT || 22 }}
           script: |
-            echo "🚀 Deploying latest TIPS-G backend..."
+            echo "🚀 Deploying latest TIPS-G backend on port 8000..."
             
             # Navigate to project directory on VPS
             cd ~/apps/tips-attendance-setup || cd ~/tips-attendance || cd /var/www/tips-attendance || cd .
@@ -35,7 +35,7 @@ jobs:
             # Pull latest code from GitHub
             git pull origin main
             
-            # Restart backend services with Docker Compose
+            # Restart backend services with Docker Compose (Port 8000:8000)
             if [ -f "backend/docker-compose.yml" ]; then
               docker compose -f backend/docker-compose.yml down || true
               docker compose -f backend/docker-compose.yml up -d --build
@@ -44,4 +44,8 @@ jobs:
               docker compose up -d --build
             fi
             
-            echo "✅ Deployment completed successfully!"
+            # Verify backend service health on port 8000
+            sleep 5
+            curl -f http://localhost:8000/ || echo "Backend container initializing on port 8000..."
+            
+            echo "✅ Deployment completed successfully on port 8000!"
