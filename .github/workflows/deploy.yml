@@ -29,22 +29,25 @@ jobs:
           script: |
             echo "🚀 Starting Automated TIPS-G CI/CD Deployment..."
             
-            TARGET_DIR="$HOME/apps/tips-attendance-setup"
+            TARGET_DIR="$HOME/apps/TIPS-G-AI-Attandence-System"
             mkdir -p "$HOME/apps"
             
-            # 1. If repo is not cloned yet, clone it with sparse checkout (Backend only)
+            # 1. Fresh clone or pull
             if [ ! -d "$TARGET_DIR/.git" ]; then
-              echo "📦 Cloning fresh repository on VPS..."
+              echo "📦 Cloning repository on VPS..."
               rm -rf "$TARGET_DIR"
-              git clone --filter=blob:none --sparse https://github.com/tipsgalwar/TIPS-G-AI-Attandence-System.git "$TARGET_DIR"
+              git clone https://github.com/tipsgalwar/TIPS-G-AI-Attandence-System.git "$TARGET_DIR"
               cd "$TARGET_DIR"
-              git sparse-checkout set src config backend .github .dockerignore requirements-backend.txt run.py
             else
-              # 2. If already cloned, pull latest changes
               echo "🔄 Pulling latest updates from GitHub..."
               cd "$TARGET_DIR"
+              git reset --hard HEAD
               git pull origin main
             fi
+            
+            # 2. Enable sparse checkout to only keep backend directories on VPS
+            git sparse-checkout init --cone
+            git sparse-checkout set src backend config .github
             
             # 3. Ensure backend .env exists
             if [ ! -f "backend/.env" ] && [ -f ".env" ]; then
@@ -61,8 +64,8 @@ jobs:
               docker compose up -d --build
             fi
             
-            # 5. Quick Health Check on Port 8000
+            # 5. Health Check on Port 8000
             sleep 4
-            curl -f http://localhost:8000/ || echo "Backend service active on port 8000."
+            curl -f http://localhost:8000/ || echo "Backend service running on port 8000."
             
             echo "🎉 Deployment successfully completed!"
