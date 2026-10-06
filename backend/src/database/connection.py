@@ -87,13 +87,26 @@ if "sqlite" in DATABASE_URL:
         connect_args={"check_same_thread": False}
     )
 else:
+    # Explicitly adapt driver prefix for PostgreSQL to avoid dialect resolution failures
+    pg_url = DATABASE_URL
+    if pg_url.startswith("postgresql://"):
+        try:
+            import psycopg2
+            pg_url = pg_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+        except ImportError:
+            try:
+                import psycopg
+                pg_url = pg_url.replace("postgresql://", "postgresql+psycopg://", 1)
+            except ImportError:
+                pass
+
     engine = create_engine(
-        DATABASE_URL,
+        pg_url,
         pool_size=10,
         max_overflow=20,
         pool_pre_ping=True,
         pool_recycle=1800,
-        connect_args={"sslmode": "require"} if "sslmode" not in DATABASE_URL else {},
+        connect_args={"sslmode": "require"} if "sslmode" not in pg_url else {},
     )
 
 # Setup SessionLocal factory
