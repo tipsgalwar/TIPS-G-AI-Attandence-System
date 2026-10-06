@@ -57,11 +57,11 @@ jobs:
             # 4. Rebuild and launch backend container on Port 8004
             echo "🐳 Building and starting Docker container on Port 8004..."
             if [ -f "backend/docker-compose.yml" ]; then
-              docker compose -f backend/docker-compose.yml down || true
-              docker compose -f backend/docker-compose.yml up -d --build
+              docker compose -p tipsg_v3 -f backend/docker-compose.yml down || true
+              docker compose -p tipsg_v3 -f backend/docker-compose.yml up -d --build
             elif [ -f "docker-compose.yml" ]; then
-              docker compose down || true
-              docker compose up -d --build
+              docker compose -p tipsg_v3 down || true
+              docker compose -p tipsg_v3 up -d --build
             fi
             
             # 5. Health Check on Port 8004

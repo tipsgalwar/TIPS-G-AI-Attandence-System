@@ -1,9 +1,12 @@
+name: tipsg_v3
+
 services:
   backend:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: tipsg_attendance_backend
+    image: tipsg_backend_v3:latest
+    container_name: tipsg_attendance_backend_v3
     restart: always
     env_file:
       - .env
