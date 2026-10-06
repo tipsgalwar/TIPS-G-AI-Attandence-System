@@ -54,8 +54,8 @@ jobs:
               cp .env backend/.env
             fi
             
-            # 4. Rebuild and launch backend container on Port 8003
-            echo "🐳 Building and starting Docker container on Port 8003..."
+            # 4. Rebuild and launch backend container on Port 8004
+            echo "🐳 Building and starting Docker container on Port 8004..."
             if [ -f "backend/docker-compose.yml" ]; then
               docker compose -f backend/docker-compose.yml down || true
               docker compose -f backend/docker-compose.yml up -d --build
@@ -64,8 +64,8 @@ jobs:
               docker compose up -d --build
             fi
             
-            # 5. Health Check on Port 8003
+            # 5. Health Check on Port 8004
             sleep 4
-            curl -f http://localhost:8003/ || echo "Backend service running on port 8003."
+            curl -f http://localhost:8004/ || echo "Backend service running on port 8004."
             
             echo "🎉 Deployment successfully completed!"

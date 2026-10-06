@@ -92,5 +92,5 @@ def read_root():
 
 if __name__ == "__main__":
     host = settings.system.get("host", "127.0.0.1")
-    port = settings.system.get("port", 8003)
+    port = settings.system.get("port", 8004)
     uvicorn.run("src.backend.main:app", host=host, port=port, reload=True)

@@ -59,7 +59,7 @@ def main():
 
     # Launch FastAPI backend server directly via uvicorn
     host = args.host or os.getenv("BACKEND_HOST", "0.0.0.0")
-    port = args.port or int(os.getenv("BACKEND_PORT", "8003"))
+    port = args.port or int(os.getenv("BACKEND_PORT", "8004"))
     is_prod = os.getenv("ENVIRONMENT") == "production"
     reload_flag = args.reload if args.reload is not None else (not is_prod)
     workers_count = args.workers or (2 if is_prod else 1)

@@ -30,8 +30,8 @@ COPY run.py .
 RUN mkdir -p storage/reports storage/students storage/documents logs
 
 # Expose FastAPI backend port
-EXPOSE 8003
+EXPOSE 8004
 
 # Run FastAPI backend directly using uvicorn for optimal performance and health checks
-CMD ["uvicorn", "src.backend.main:app", "--host", "0.0.0.0", "--port", "8003", "--workers", "2", "--proxy-headers", "--forwarded-allow-ips", "*"]
+CMD ["uvicorn", "src.backend.main:app", "--host", "0.0.0.0", "--port", "8004", "--workers", "2", "--proxy-headers", "--forwarded-allow-ips", "*"]
 

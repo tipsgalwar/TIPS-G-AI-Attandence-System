@@ -91,11 +91,11 @@ class EnvironmentSettings:
     
     # ======================= BACKEND =======================
     BACKEND_HOST: str = EnvConfig.get('BACKEND_HOST', '127.0.0.1')
-    BACKEND_PORT: int = EnvConfig.get_int('BACKEND_PORT', 8003)
-    BACKEND_URL: str = EnvConfig.get('BACKEND_URL', 'http://127.0.0.1:8003')
+    BACKEND_PORT: int = EnvConfig.get_int('BACKEND_PORT', 8004)
+    BACKEND_URL: str = EnvConfig.get('BACKEND_URL', 'http://127.0.0.1:8004')
     
     # ======================= FRONTEND =======================
-    FRONTEND_API_BASE_URL: str = EnvConfig.get('FRONTEND_API_BASE_URL', 'http://127.0.0.1:8003')
+    FRONTEND_API_BASE_URL: str = EnvConfig.get('FRONTEND_API_BASE_URL', 'http://127.0.0.1:8004')
     FRONTEND_TIMEOUT: int = EnvConfig.get_int('FRONTEND_TIMEOUT', 30)
     APP_ICON_FILE: str = EnvConfig.get('APP_ICON_FILE', 'TIPS-G-ALWAR.ico')
     

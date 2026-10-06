@@ -9,16 +9,16 @@ services:
       - .env
     environment:
       - BACKEND_HOST=0.0.0.0
-      - BACKEND_PORT=8003
+      - BACKEND_PORT=8004
       - TZ=Asia/Kolkata
-    command: uvicorn src.backend.main:app --host 0.0.0.0 --port 8003 --workers 2 --proxy-headers --forwarded-allow-ips *
+    command: uvicorn src.backend.main:app --host 0.0.0.0 --port 8004 --workers 2 --proxy-headers --forwarded-allow-ips *
     volumes:
       - ./storage:/app/storage
       - ./logs:/app/logs
     ports:
-      - "8003:8003"
+      - "8004:8004"
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8003/ || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8004/ || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3

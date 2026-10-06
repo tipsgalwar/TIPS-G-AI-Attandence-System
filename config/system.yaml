@@ -1,6 +1,6 @@
 system:
   host: "127.0.0.1"
-  port: 8003
+  port: 8004
   debug: true
   storage_dir: "storage"
   log_level: "INFO"
