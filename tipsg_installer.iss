@@ -5,7 +5,7 @@
 ; ============================================================================
 
 #define MyAppName "TIPS-G ALWAR Attendance System"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.7"
 #define MyAppPublisher "TIPS-G ALWAR"
 #define MyAppURL "https://tipsg.edu.in"
 #define MyAppExeName "TIPS-G-Attendance.exe"
@@ -48,7 +48,7 @@ Name: "downloadmodels"; Description: "Download / Verify AI Face Recognition Mode
 Source: "dist\TIPS-G-Attendance.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 ; Configuration File (Pre-configured with VPS backend host)
-Source: "config.ini"; DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist
+Source: "config.ini"; DestDir: "{app}"; Flags: ignoreversion
 
 ; Brand Assets & Icons
 Source: "storage\TIPS-G-ALWAR.ico"; DestDir: "{app}\storage"; Flags: ignoreversion

@@ -1,3 +1,4 @@
+import os
 import re
 import secrets
 from datetime import datetime, timedelta
@@ -56,7 +57,6 @@ class VerifyEmailOtpRequest(BaseModel):
     email: str
     otp: str
     username: Optional[str] = None
-
 
 @router.post("/forgot-password")
 def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)):

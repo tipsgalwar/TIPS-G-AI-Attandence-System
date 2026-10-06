@@ -6,7 +6,7 @@ from src.config_loader import settings
 
 SECRET_KEY = settings.system.get("jwt_secret", "supersecretkeychangeinproduction")
 ALGORITHM = settings.system.get("jwt_algorithm", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = settings.system.get("access_token_expire_minutes", 1440)
+ACCESS_TOKEN_EXPIRE_MINUTES = int(settings.system.get("access_token_expire_minutes", 10080))
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verifies a plain password against a hashed one."""

@@ -3,7 +3,7 @@ import math
 from datetime import datetime, date, time, timedelta, timezone
 
 _IST = timezone(timedelta(hours=5, minutes=30))
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -213,8 +213,8 @@ async def verify_face_attendance(
 
     cosine_dist = _compute_cosine_distance(candidate_norm, stored_norm)
     confidence = round((1.0 - cosine_dist) * 100, 2)
-    min_conf = float(settings.ai_models.get("minimum_confidence", 60.0))
-    similarity_threshold = float(settings.ai_models.get("similarity_threshold", 0.40))
+    min_conf = float(settings.ai_models.get("minimum_confidence", 50.0))
+    similarity_threshold = float(settings.ai_models.get("similarity_threshold", 0.50))
 
     if cosine_dist > similarity_threshold or confidence < min_conf:
         print(f"Steps 4b: Verification rejected - distance {cosine_dist:.4f}, confidence {confidence:.2f}%")
@@ -222,7 +222,7 @@ async def verify_face_attendance(
             "status": "failed",
             "error": "Face verification failed. Low similarity or confidence.",
             "confidence": confidence,
-            "distance": cosine_dist
+            "distance": round(cosine_dist, 4)
         }
 
     print(f"Steps 4a: ✅ Face verified on backend: {student.full_name} with confidence: {confidence}%")
@@ -402,14 +402,15 @@ async def admin_verify_face_attendance(
 
     cosine_dist = _compute_cosine_distance(candidate_norm, stored_norm)
     confidence = round((1.0 - cosine_dist) * 100, 2)
-    min_conf = float(settings.ai_models.get("minimum_confidence", 65.0))
-    similarity_threshold = float(settings.ai_models.get("similarity_threshold", 0.40))
+    min_conf = float(settings.ai_models.get("minimum_confidence", 50.0))
+    similarity_threshold = float(settings.ai_models.get("similarity_threshold", 0.50))
 
     if cosine_dist > similarity_threshold or confidence < min_conf:
         return {
             "status": "failed",
             "error": f"Face verification failed. The person in frame does not match {student.full_name}.",
             "confidence": confidence,
+            "distance": round(cosine_dist, 4),
         }
 
     today = datetime.now(_IST).date()
@@ -572,9 +573,20 @@ def record_manual_attendance(
         "verification_method": record.verification_method
     }
 
+def _dispatch_absence_alerts_task(scan_date: date):
+    from src.database.connection import SessionLocal
+    bg_db = SessionLocal()
+    try:
+        alert_service.check_and_trigger_absence_alerts(bg_db, scan_date)
+    except Exception as exc:
+        logger.error(f"Background absence alerts dispatch error: {exc}")
+    finally:
+        bg_db.close()
+
 @router.post("/trigger-scan")
 def trigger_evening_absence_scan(
     target_date: Optional[str] = None,
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db),
     current_user = Depends(require_teacher)
 ):
@@ -617,11 +629,260 @@ def trigger_evening_absence_scan(
 
     db.commit()
     
-    # 2. Trigger notifications via AlertService
-    triggered_alerts = alert_service.check_and_trigger_absence_alerts(db, scan_date)
+    # 2. Trigger notifications via AlertService in background to prevent client timeouts
+    if background_tasks:
+        background_tasks.add_task(_dispatch_absence_alerts_task, scan_date)
+        triggered_alerts = marked_absent_count
+    else:
+        triggered_alerts = alert_service.check_and_trigger_absence_alerts(db, scan_date)
 
     return {
         "message": "Daily evening scan completed successfully.",
         "marked_absent_count": marked_absent_count,
         "triggered_alerts_count": triggered_alerts
+    }
+
+
+@router.get("/student/monthly-analytics")
+def get_student_monthly_analytics(
+    student_id: Optional[int] = None,
+    month: Optional[int] = None,
+    year: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user = Depends(require_auth)
+):
+    """
+    Returns comprehensive monthly attendance analytics, calendar heatmap data,
+    and annual trend metrics for the requested student.
+    """
+    import calendar
+    now = datetime.now(_IST)
+    target_month = month or now.month
+    target_year = year or now.year
+
+    target_student_id = student_id
+    if isinstance(current_user, Student):
+        target_student_id = current_user.id
+    elif not target_student_id:
+        target_student_id = current_user.id if hasattr(current_user, "id") else None
+
+    if not target_student_id:
+        raise HTTPException(status_code=400, detail="Student ID required")
+
+    student = db.query(Student).filter(Student.id == target_student_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+
+    num_days = calendar.monthrange(target_year, target_month)[1]
+    start_d = date(target_year, target_month, 1)
+    end_d = date(target_year, target_month, num_days)
+
+    records = db.query(Attendance).filter(
+        Attendance.student_id == target_student_id,
+        Attendance.date >= start_d,
+        Attendance.date <= end_d
+    ).all()
+    record_map = {r.date: r for r in records}
+
+    holidays = db.query(Holiday).filter(
+        Holiday.date >= start_d,
+        Holiday.date <= end_d
+    ).all()
+    holiday_map = {h.date: h.name for h in holidays}
+
+    total_working_days = 0
+    present_count = 0
+    late_count = 0
+    absent_count = 0
+    leave_count = 0
+    daily_map = {}
+
+    for d in range(1, num_days + 1):
+        cur_date = date(target_year, target_month, d)
+        date_str = str(cur_date)
+        is_sunday = cur_date.weekday() == 6
+        is_holiday = cur_date in holiday_map
+
+        if cur_date in record_map:
+            r = record_map[cur_date]
+            st = r.status.capitalize()
+            c_in = r.check_in.strftime("%I:%M %p") if r.check_in and hasattr(r.check_in, "strftime") else (str(r.check_in)[:5] if r.check_in else None)
+            c_out = r.check_out.strftime("%I:%M %p") if r.check_out and hasattr(r.check_out, "strftime") else (str(r.check_out)[:5] if r.check_out else None)
+            
+            if st in ["Present", "Late"]:
+                present_count += 1
+                if st == "Late":
+                    late_count += 1
+            elif st == "Absent":
+                absent_count += 1
+            elif st == "Leave":
+                leave_count += 1
+
+            if not is_sunday and not is_holiday:
+                total_working_days += 1
+
+            daily_map[date_str] = {
+                "status": st,
+                "check_in": c_in,
+                "check_out": c_out,
+                "is_holiday": is_holiday,
+                "holiday_name": holiday_map.get(cur_date, "")
+            }
+        else:
+            if is_holiday:
+                status_label = "Holiday"
+            elif is_sunday:
+                status_label = "Weekend"
+            elif cur_date < now.date():
+                status_label = "Unrecorded"
+                total_working_days += 1
+            else:
+                status_label = "Upcoming"
+
+            daily_map[date_str] = {
+                "status": status_label,
+                "check_in": None,
+                "check_out": None,
+                "is_holiday": is_holiday,
+                "holiday_name": holiday_map.get(cur_date, "")
+            }
+
+    pct = round((present_count / total_working_days * 100), 1) if total_working_days > 0 else 100.0
+
+    # Annual Month-by-Month Trend for chart
+    monthly_trend = []
+    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    for m in range(1, 13):
+        m_start = date(target_year, m, 1)
+        m_end = date(target_year, m, calendar.monthrange(target_year, m)[1])
+        m_recs = db.query(Attendance).filter(
+            Attendance.student_id == target_student_id,
+            Attendance.date >= m_start,
+            Attendance.date <= m_end,
+            Attendance.status.in_(["Present", "Late"])
+        ).count()
+        m_total = db.query(Attendance).filter(
+            Attendance.student_id == target_student_id,
+            Attendance.date >= m_start,
+            Attendance.date <= m_end
+        ).count()
+        m_pct = round((m_recs / m_total * 100), 1) if m_total > 0 else 0.0
+        monthly_trend.append({"month": month_names[m - 1], "month_num": m, "percentage": m_pct, "present": m_recs})
+
+    return {
+        "student_id": target_student_id,
+        "student_name": student.full_name,
+        "registration_number": student.registration_number,
+        "month": target_month,
+        "month_name": month_names[target_month - 1],
+        "year": target_year,
+        "total_days": num_days,
+        "total_working_days": total_working_days,
+        "present_days": present_count,
+        "on_time_days": max(0, present_count - late_count),
+        "late_days": late_count,
+        "absent_days": absent_count,
+        "leave_days": leave_count,
+        "percentage": pct,
+        "target_percentage": 75.0,
+        "is_shortage": pct < 75.0,
+        "daily_map": daily_map,
+        "monthly_trend": monthly_trend
+    }
+
+
+@router.get("/admin/matrix")
+def get_admin_attendance_matrix(
+    month: Optional[int] = None,
+    year: Optional[int] = None,
+    department: Optional[str] = None,
+    search: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user = Depends(require_teacher)
+):
+    """
+    Returns college-wide / class-wide attendance matrix for all students
+    with monthly aggregates, percentage thresholds, and shortage indicators.
+    """
+    import calendar
+    now = datetime.now(_IST)
+    target_month = month or now.month
+    target_year = year or now.year
+
+    query = db.query(Student).filter(Student.is_active == True)
+    if department and department.lower() != "all":
+        query = query.filter(Student.department == department)
+    if search:
+        search_fmt = f"%{search}%"
+        query = query.filter(
+            (Student.full_name.ilike(search_fmt)) |
+            (Student.registration_number.ilike(search_fmt)) |
+            (Student.roll_number.ilike(search_fmt))
+        )
+
+    students = query.order_by(Student.registration_number).all()
+
+    num_days = calendar.monthrange(target_year, target_month)[1]
+    start_d = date(target_year, target_month, 1)
+    end_d = date(target_year, target_month, num_days)
+
+    all_records = db.query(Attendance).filter(
+        Attendance.date >= start_d,
+        Attendance.date <= end_d
+    ).all()
+
+    from collections import defaultdict
+    student_records = defaultdict(list)
+    for r in all_records:
+        student_records[r.student_id].append(r)
+
+    rows = []
+    total_pct_sum = 0.0
+    defaulter_count = 0
+
+    for s in students:
+        s_recs = student_records[s.id]
+        total_logged = len(s_recs)
+        present = sum(1 for r in s_recs if r.status in ["Present", "Late"])
+        late = sum(1 for r in s_recs if r.status == "Late")
+        absent = sum(1 for r in s_recs if r.status == "Absent")
+        leave = sum(1 for r in s_recs if r.status == "Leave")
+
+        effective_total = max(1, total_logged)
+        pct = round((present / effective_total) * 100, 1) if total_logged > 0 else 0.0
+        total_pct_sum += pct
+
+        status_flag = "good"
+        if pct < 65.0:
+            status_flag = "danger"
+            defaulter_count += 1
+        elif pct < 75.0:
+            status_flag = "warning"
+            defaulter_count += 1
+
+        rows.append({
+            "id": s.id,
+            "registration_number": s.registration_number,
+            "roll_number": s.roll_number or s.registration_number,
+            "full_name": s.full_name,
+            "department": s.department or "General",
+            "semester": s.semester or "1",
+            "total_logged": total_logged,
+            "present": present,
+            "late": late,
+            "absent": absent,
+            "leave": leave,
+            "percentage": pct,
+            "status_flag": status_flag
+        })
+
+    avg_pct = round(total_pct_sum / max(1, len(students)), 1)
+
+    return {
+        "month": target_month,
+        "year": target_year,
+        "total_students": len(students),
+        "class_average_percentage": avg_pct,
+        "defaulters_count": defaulter_count,
+        "matrix": rows
     }

@@ -100,8 +100,18 @@ def ensure_models_exist(models_to_check=None, verbose=True) -> bool:
         project_root = Path(sys.executable).parent
     else:
         project_root = Path(__file__).resolve().parent.parent
+    
     models_dir = project_root / "models"
-    models_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        models_dir.mkdir(parents=True, exist_ok=True)
+        # Test write permission
+        test_file = models_dir / ".write_test"
+        test_file.touch(exist_ok=True)
+        test_file.unlink(missing_ok=True)
+    except Exception:
+        # Fall back to user home directory if Program Files is read-only
+        models_dir = Path.home() / ".tipsg" / "models"
+        models_dir.mkdir(parents=True, exist_ok=True)
     
     target_models = models_to_check if models_to_check is not None else list(MODELS.keys())
     all_success = True

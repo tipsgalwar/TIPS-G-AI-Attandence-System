@@ -51,7 +51,11 @@ class ReportService:
             rows_archived = db.query(Attendance).filter(
                 Attendance.date >= start_date,
                 Attendance.date < end_date
-            ).delete(synchronize_session=False)
+            ).count()
+
+            if rows_archived == 0:
+                continue
+
             db.add(MonthlyReportArchive(
                 year=year,
                 month=month,
@@ -61,7 +65,7 @@ class ReportService:
             ))
             db.commit()
             archives_created += 1
-            logger.info(f"Archived {rows_archived} attendance rows for {year}-{month:02d}: {file_path}")
+            logger.info(f"Generated monthly report for {year}-{month:02d} ({rows_archived} rows preserved): {file_path}")
 
         return archives_created
     def get_daily_summary(self, db: Session, target_date: date) -> dict:

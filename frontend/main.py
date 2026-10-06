@@ -37,10 +37,12 @@ import numpy as np
 try:
     from frontend.api_client import api_client
     from frontend.onnx_face_service import onnx_face_service
+    from frontend.student_analytics import StudentAttendanceAnalyticsWidget, StudentAttendanceHeatmapDialog
 except ImportError:
     sys.path.append(str(Path(__file__).resolve().parent.parent))
     from frontend.api_client import api_client
     from frontend.onnx_face_service import onnx_face_service
+    from frontend.student_analytics import StudentAttendanceAnalyticsWidget, StudentAttendanceHeatmapDialog
 
 def format_12hr_time(val) -> str:
     if not val:
@@ -369,6 +371,66 @@ class CameraThread(QThread):
         self._run_flag = False
         self.wait()
 
+class AsyncFaceVerifyWorker(QThread):
+    """
+    Non-blocking background biometric verification worker.
+    Runs single-pass landmark extraction, eye-blink trajectory tracking,
+    anti-spoofing, and ArcFace recognition without blocking the Qt GUI thread.
+    """
+    progress_update = pyqtSignal(str)
+    verification_finished = pyqtSignal(dict)
+
+    def __init__(self, target_embedding: list, frame_getter_callback, duration_sec: float = 2.4):
+        super().__init__()
+        self.target_embedding = target_embedding
+        self.frame_getter = frame_getter_callback
+        self.duration_sec = duration_sec
+
+    def run(self):
+        try:
+            from frontend.onnx_face_service import onnx_face_service
+            import time
+
+            self.progress_update.emit("🔍 Initializing biometric AI engine...")
+            onnx_face_service.ensure_models_loaded()
+
+            self.progress_update.emit("👁️ Live Anti-Spoof: Please BLINK your eyes naturally now...")
+
+            frames_to_check = []
+            start_time = time.time()
+            last_frame = None
+
+            # Collect live camera frames with high temporal resolution (up to 2.4s)
+            while (time.time() - start_time) < self.duration_sec:
+                cur_frame = self.frame_getter()
+                if cur_frame is not None and (last_frame is None or cur_frame is not last_frame):
+                    frames_to_check.append(cur_frame)
+                    last_frame = cur_frame
+
+                    # Fast early-exit: once sufficient frames are collected and a blink is detected
+                    if len(frames_to_check) >= 8 and len(frames_to_check) % 3 == 0:
+                        if onnx_face_service.has_detected_blink(frames_to_check[-12:]):
+                            break
+                time.sleep(0.035)
+
+            if not frames_to_check:
+                cur_frame = self.frame_getter()
+                if cur_frame is not None:
+                    frames_to_check.append(cur_frame)
+
+            self.progress_update.emit("🧠 Verifying biological liveness & facial geometry...")
+            verify_res = onnx_face_service.verify_face_burst(
+                frames_to_check,
+                self.target_embedding
+            )
+            self.verification_finished.emit(verify_res)
+        except Exception as e:
+            logger.error(f"AsyncFaceVerifyWorker error: {e}")
+            self.verification_finished.emit({
+                "verified": False,
+                "error": f"Verification error: {str(e)}"
+            })
+
 def capture_registration_photo(parent: QWidget) -> bytes:
     """Capture one high-quality registration photo from the camera using Space with live box outline."""
     camera = cv2.VideoCapture(0, cv2.CAP_DSHOW) if sys.platform.startswith("win") else cv2.VideoCapture(0)
@@ -611,6 +673,67 @@ class LoginWindow(QWidget):
         self.forgot_pwd_btn.setEnabled(True)
 
         if res["status"] == "success":
+            user_data = res["user"]
+            username_val = user_data.get("username") or user
+            
+            # Hardware Device Binding & Authorization Check
+            try:
+                from frontend.utils.device_hwid import check_device_authorization, authorize_device, validate_master_passcode
+                
+                dev_status = check_device_authorization(username_val)
+                if not dev_status["authorized"]:
+                    reason = dev_status.get("reason", "NEW_DEVICE")
+                    if reason == "SWITCH_ACCOUNT":
+                        prompt_title = "🔐 Account Switch Authorization Required"
+                        prompt_msg = (
+                            f"⚠ Machine Exclusivity Lock!\n\n"
+                            f"This computer is currently locked to: '{dev_status['locked_user']}'.\n"
+                            f"You are attempting to log into a different account: '{username_val}'.\n\n"
+                            f"To switch user accounts on this machine, enter the Admin Master Passcode:"
+                        )
+                    else:
+                        prompt_title = "🔐 New Device Authorization Required"
+                        prompt_msg = (
+                            f"⚠ Unrecognized Machine Detected!\n\n"
+                            f"Account '{username_val}' is bound to another device ({dev_status['registered_hwid']}).\n"
+                            f"Current Machine: {dev_status['device_name']} ({dev_status['current_hwid']})\n\n"
+                            f"To authorize this new machine, enter the Admin Master Passcode:"
+                        )
+
+                    passcode, ok = QInputDialog.getText(
+                        self,
+                        prompt_title,
+                        prompt_msg,
+                        QLineEdit.EchoMode.Password
+                    )
+                    if not ok or not passcode.strip():
+                        api_client.logout()
+                        self.error_label.setText("❌ Login aborted: Device authorization cancelled.")
+                        return
+                    
+                    if validate_master_passcode(passcode.strip(), username_val, dev_status["current_hwid"]):
+                        authorize_device(username_val, dev_status["current_hwid"])
+                        QMessageBox.information(
+                            self,
+                            "Device Authorized",
+                            f"✅ Machine successfully authorized for account '{username_val}'!\nYou may now log in."
+                        )
+                    else:
+                        api_client.logout()
+                        self.error_label.setText("❌ Invalid Master Passcode! Authorization denied.")
+                        QMessageBox.critical(
+                            self,
+                            "Authorization Denied",
+                            "❌ The Master Security Passcode entered is incorrect.\n"
+                            "You cannot switch accounts or access this system from an unauthorized machine."
+                        )
+                        return
+                elif dev_status.get("reason") == "FIRST_TIME":
+                    # Automatically bind the machine to this user on their first login
+                    authorize_device(username_val, dev_status["current_hwid"])
+            except Exception as hw_err:
+                logger.debug(f"Device HWID verification note: {hw_err}")
+
             self.login_success.emit(res["user"])
         else:
             self.error_label.setText(res.get("error", "Login validation failed."))
@@ -1068,6 +1191,242 @@ class NotificationSocketWorker(QThread):
                 pass
         self.wait(2000)
 
+class StudentDetailsDialog(QDialog):
+    """
+    Comprehensive Student Profile & Biometrics Details Dialog.
+    Displays student photo, face embedding status, personal contact details,
+    parent/guardian contact details, and account status.
+    """
+    def __init__(self, student: dict, parent=None, is_admin: bool = False, on_delete=None):
+        super().__init__(parent)
+        self.student = student or {}
+        self.is_admin = is_admin
+        self.on_delete = on_delete
+        self.setWindowTitle(f"Student Profile — {self.student.get('full_name', 'Details')}")
+        self.setMinimumSize(540, 620)
+        self.resize(560, 640)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f1f5f9;
+            }
+            QFrame#HeaderCard, QFrame#InfoCard {
+                background-color: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 14px;
+            }
+            QLabel {
+                background: transparent;
+                border: none;
+                padding: 0px;
+                margin: 0px;
+            }
+        """)
+        self.init_ui()
+
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(24, 24, 24, 24)
+        main_layout.setSpacing(18)
+
+        # ── 1. Header Profile Card ──────────────────────────────────────────
+        header_card = QFrame()
+        header_card.setObjectName("HeaderCard")
+        header_card.setStyleSheet("""
+            QFrame#HeaderCard {
+                background-color: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 14px;
+                padding: 18px;
+            }
+        """)
+        hdr_layout = QHBoxLayout(header_card)
+        hdr_layout.setContentsMargins(18, 18, 18, 18)
+        hdr_layout.setSpacing(18)
+
+        # Avatar / Photo
+        avatar_lbl = QLabel()
+        avatar_lbl.setFixedSize(80, 80)
+        avatar_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        photo_path = self.student.get("photo_path")
+        pix = None
+        if photo_path and os.path.exists(photo_path):
+            try:
+                pix = QPixmap(photo_path)
+            except Exception:
+                pix = None
+
+        if pix and not pix.isNull():
+            avatar_lbl.setPixmap(pix.scaled(80, 80, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation))
+            avatar_lbl.setStyleSheet("border-radius: 40px; border: 2px solid #3b82f6;")
+        else:
+            name = self.student.get("full_name") or "Student"
+            initials = "".join([part[0].upper() for part in name.split()[:2]]) or "ST"
+            avatar_lbl.setText(initials)
+            avatar_lbl.setStyleSheet("""
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #3b82f6, stop:1 #1d4ed8);
+                color: #ffffff;
+                font-size: 26px;
+                font-weight: 800;
+                border-radius: 40px;
+                border: none;
+            """)
+        hdr_layout.addWidget(avatar_lbl)
+
+        # Student Name & Reg ID
+        title_box = QVBoxLayout()
+        title_box.setSpacing(4)
+        name_lbl = QLabel(self.student.get("full_name", "Student Name"))
+        name_lbl.setStyleSheet("font-size: 20px; font-weight: 800; color: #0f172a; border: none; background: transparent;")
+        title_box.addWidget(name_lbl)
+
+        reg_badge = QLabel(f"Reg No: {self.student.get('registration_number', '-')}")
+        reg_badge.setStyleSheet("font-size: 13px; font-weight: 600; color: #2563eb; border: none; background: transparent;")
+        title_box.addWidget(reg_badge)
+
+        course_lbl = QLabel(f"🎓 Course: {self.student.get('class_name', 'General')}")
+        course_lbl.setStyleSheet("font-size: 13px; color: #475569; border: none; background: transparent;")
+        title_box.addWidget(course_lbl)
+
+        has_photo = bool(photo_path and os.path.exists(photo_path))
+        bio_status = "🟢 Biometric Vector Node Enrolled" if has_photo else "⚪ Biometrics Pending Enrollment"
+        bio_color = "#059669" if has_photo else "#64748b"
+        bio_lbl = QLabel(bio_status)
+        bio_lbl.setStyleSheet(f"font-size: 11px; font-weight: 700; color: {bio_color}; margin-top: 4px; border: none; background: transparent;")
+        title_box.addWidget(bio_lbl)
+
+        hdr_layout.addLayout(title_box)
+        hdr_layout.addStretch()
+        main_layout.addWidget(header_card)
+
+        # ── 2. Information Details Grid ─────────────────────────────────────
+        info_card = QFrame()
+        info_card.setObjectName("InfoCard")
+        info_card.setStyleSheet("""
+            QFrame#InfoCard {
+                background-color: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 14px;
+                padding: 16px;
+            }
+        """)
+        info_layout = QVBoxLayout(info_card)
+        info_layout.setContentsMargins(18, 18, 18, 18)
+        info_layout.setSpacing(12)
+
+        def make_section_title(txt: str):
+            lbl = QLabel(txt)
+            lbl.setStyleSheet("font-size: 12px; font-weight: 800; color: #1e3a8a; text-transform: uppercase; letter-spacing: 0.6px; border: none; border-bottom: 2px solid #e2e8f0; padding-bottom: 4px; background: transparent;")
+            return lbl
+
+        def make_row(label: str, value: str):
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 2, 0, 2)
+            lbl = QLabel(label)
+            lbl.setStyleSheet("font-size: 13px; font-weight: 600; color: #64748b; min-width: 140px; max-width: 150px; border: none; background: transparent;")
+            val_text = str(value).strip() if value and str(value).strip() not in ["None", ""] else "—"
+            val = QLabel(val_text)
+            val.setStyleSheet("font-size: 13px; font-weight: 700; color: #0f172a; border: none; background: transparent;")
+            val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            row.addWidget(lbl)
+            row.addWidget(val)
+            row.addStretch()
+            return row
+
+        info_layout.addWidget(make_section_title("Student Information"))
+        info_layout.addLayout(make_row("Student ID:", str(self.student.get("id", "-"))))
+        s_phone = self.student.get("phone") or self.student.get("parent_phone") or ""
+        info_layout.addLayout(make_row("Student Phone:", s_phone))
+        s_email = self.student.get("email") or self.student.get("parent_email") or ""
+        info_layout.addLayout(make_row("Student Email:", s_email))
+        info_layout.addLayout(make_row("Account Status:", "Active" if self.student.get("is_active", True) else "Inactive"))
+
+        info_layout.addSpacing(6)
+        info_layout.addWidget(make_section_title("Parent / Guardian Details"))
+        info_layout.addLayout(make_row("Guardian Name:", self.student.get("parent_name", "")))
+        p_phone = self.student.get("parent_phone") or self.student.get("phone") or ""
+        info_layout.addLayout(make_row("Guardian Phone:", p_phone))
+        p_email = self.student.get("parent_email") or self.student.get("email") or ""
+        info_layout.addLayout(make_row("Guardian Email:", p_email))
+
+        main_layout.addWidget(info_card)
+
+        # ── 3. Actions / Footer ─────────────────────────────────────────────
+        btn_bar = QHBoxLayout()
+        btn_bar.setSpacing(12)
+
+        if self.is_admin and self.on_delete:
+            del_btn = QPushButton("🗑️ Remove Student")
+            del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            del_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #fef2f2;
+                    color: #dc2626;
+                    border: 1px solid #fca5a5;
+                    border-radius: 8px;
+                    padding: 8px 16px;
+                    font-weight: 700;
+                    font-size: 12px;
+                }
+                QPushButton:hover {
+                    background-color: #fee2e2;
+                }
+            """)
+            del_btn.clicked.connect(self._handle_delete)
+            btn_bar.addWidget(del_btn)
+
+        heatmap_btn = QPushButton("📅 View Attendance Heatmap")
+        heatmap_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        heatmap_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ecfdf5;
+                color: #047857;
+                border: 1px solid #a7f3d0;
+                border-radius: 8px;
+                padding: 8px 16px;
+                font-weight: 700;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #d1fae5;
+            }
+        """)
+        heatmap_btn.clicked.connect(self._open_heatmap_dialog)
+        btn_bar.addWidget(heatmap_btn)
+
+        btn_bar.addStretch()
+
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2563eb;
+                color: #ffffff;
+                border-radius: 8px;
+                padding: 8px 22px;
+                font-weight: 700;
+                font-size: 13px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #1d4ed8;
+            }
+        """)
+        close_btn.clicked.connect(self.accept)
+        btn_bar.addWidget(close_btn)
+
+        main_layout.addLayout(btn_bar)
+
+    def _open_heatmap_dialog(self):
+        dlg = StudentAttendanceHeatmapDialog(self.student, self)
+        dlg.exec()
+
+    def _handle_delete(self):
+        if self.on_delete:
+            self.accept()
+            self.on_delete(self.student.get("id"))
+
+
 class PageDataLoader(QThread):
     data_loaded = pyqtSignal(int, object)
     error = pyqtSignal(int, str)
@@ -1079,25 +1438,49 @@ class PageDataLoader(QThread):
         self.user_role = str(self.user_info.get("role", "student")).lower()
 
     def run(self):
+        from datetime import date, datetime
         try:
             if self.page_index == 0:
                 summary = api_client.get_summary()
                 records = api_client.get_daily_attendance()
+                students = []
+                if self.user_role != "student":
+                    try:
+                        students = api_client.get_students()
+                    except Exception:
+                        students = []
+
                 if not summary or not records:
                     try:
                         from src.database.connection import SessionLocal
                         from src.database.models import Student, Attendance
-                        from datetime import date
                         db = SessionLocal()
                         today = date.today()
-                        total_students = db.query(Student).filter(Student.is_active == True).count()
-                        
+                        all_active_students = db.query(Student).filter(Student.is_active == True).all()
+                        if not students and all_active_students:
+                            students = [
+                                {
+                                    "id": s.id,
+                                    "registration_number": s.registration_number,
+                                    "full_name": s.full_name,
+                                    "class_name": s.class_name,
+                                    "email": s.email,
+                                    "phone": s.phone,
+                                    "parent_name": s.parent_name,
+                                    "parent_phone": s.parent_phone,
+                                    "parent_email": s.parent_email,
+                                    "photo_path": s.photo_path,
+                                    "is_active": s.is_active
+                                }
+                                for s in all_active_students
+                            ]
+
                         if self.user_role == "student" and self.user_info.get("id"):
                             student_id = self.user_info["id"]
                             daily_recs = db.query(Attendance).filter(Attendance.date == today, Attendance.student_id == student_id).all()
                         else:
                             daily_recs = db.query(Attendance).filter(Attendance.date == today).all()
-                        
+
                         if not records and daily_recs:
                             records = []
                             for r in daily_recs:
@@ -1114,26 +1497,67 @@ class PageDataLoader(QThread):
                                     "confidence_score": r.confidence_score,
                                     "verification_method": r.verification_method
                                 })
-
-                        if not summary:
-                            all_today = db.query(Attendance).filter(Attendance.date == today).all()
-                            present = sum(1 for r in all_today if r.status and r.status.lower() == "present")
-                            absent = sum(1 for r in all_today if r.status and r.status.lower() == "absent")
-                            late = sum(1 for r in all_today if r.status and r.status.lower() == "late")
-                            leave = sum(1 for r in all_today if r.status and r.status.lower() == "leave")
-                            holiday = sum(1 for r in all_today if r.status and r.status.lower() == "holiday")
-                            summary = {
-                                "total_students": total_students,
-                                "present": present,
-                                "absent": max(0, total_students - present - late - leave - holiday),
-                                "late": late,
-                                "leave": leave,
-                                "holiday": holiday
-                            }
                         db.close()
                     except Exception as db_err:
                         logger.debug(f"Direct DB summary calculation: {db_err}")
-                self.data_loaded.emit(self.page_index, {"summary": summary or {}, "records": records or []})
+
+                # Build full roster logs list merging checked-in records with absent roster
+                full_logs = []
+                recorded_student_ids = set()
+                recorded_reg_nums = set()
+
+                if records:
+                    for r in records:
+                        full_logs.append(r)
+                        if r.get("student_id"):
+                            recorded_student_ids.add(r["student_id"])
+                        if r.get("registration_number"):
+                            recorded_reg_nums.add(str(r["registration_number"]).strip().lower())
+
+                # Add active students who have not checked in today as 'Absent' entries
+                if self.user_role != "student" and students:
+                    for s in students:
+                        s_id = s.get("id")
+                        s_reg = str(s.get("registration_number", "")).strip().lower()
+                        if (s_id and s_id not in recorded_student_ids) and (s_reg not in recorded_reg_nums):
+                            full_logs.append({
+                                "id": None,
+                                "student_id": s_id,
+                                "student_name": s.get("full_name", "Unknown"),
+                                "registration_number": s.get("registration_number", "Unknown"),
+                                "date": str(date.today()),
+                                "check_in": None,
+                                "check_out": None,
+                                "status": "Absent",
+                                "confidence_score": 0.0,
+                                "verification_method": "Unmarked / System"
+                            })
+
+                total_registry = len(students) if students else summary.get("total_students", len(full_logs))
+                present_on_time = sum(1 for r in full_logs if (r.get("status") or "").lower() == "present")
+                late_count = sum(1 for r in full_logs if (r.get("status") or "").lower() == "late")
+                total_attended = present_on_time + late_count
+                leave_count = sum(1 for r in full_logs if (r.get("status") or "").lower() == "leave")
+                absent_count = sum(1 for r in full_logs if (r.get("status") or "").lower() == "absent")
+                if absent_count == 0 and total_registry > 0:
+                    absent_count = max(0, total_registry - total_attended - leave_count)
+
+                computed_summary = {
+                    "total_students": total_registry,
+                    "present": total_attended,          # Total students who marked attendance (8 present + 1 late = 9)
+                    "present_ontime": present_on_time,   # 8
+                    "late": late_count,                 # 1
+                    "absent": absent_count,             # 9
+                    "leave": leave_count,               # 0
+                    "holiday": summary.get("holiday", 0),
+                    "is_holiday": summary.get("is_holiday", False)
+                }
+
+                self.data_loaded.emit(self.page_index, {
+                    "summary": computed_summary,
+                    "records": full_logs,
+                    "students": students
+                })
             elif self.page_index == 2:
                 holidays = api_client.get_noticeboard_holidays()
                 self.data_loaded.emit(self.page_index, {"holidays": holidays})
@@ -1240,6 +1664,9 @@ class MainWindow(QMainWindow):
         self.camera_thread = None
         self.last_frame_bytes = None
         self.notification_socket = None
+        self._cached_dashboard_records = []
+        self._cached_dashboard_summary = {}
+        self.active_dashboard_filter = "all"
         
         # Apply TIPS-G ALWAR icon
         icon_manager.apply_to_window(self)
@@ -1254,12 +1681,26 @@ class MainWindow(QMainWindow):
         self.biometric_hud = BiometricScanOverlay()
         self.toast = NotificationToast(self)
         
+        # Student face embedding - loaded asynchronously in background to ensure instant startup
         self.my_embedding = None
         if self.user_info.get("role") == "student":
+            QTimer.singleShot(150, self._load_student_embedding_async)
+        
+        self.init_ui()
+        self.init_system_tray()
+        self.start_notification_socket()
+        
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(self.auto_refresh_dashboard)
+        self.refresh_timer.start(10000)
+
+    def _load_student_embedding_async(self):
+        """Asynchronously load face embedding without blocking GUI thread."""
+        def _fetch():
             try:
                 res = api_client.get_my_embedding()
-                self.my_embedding = res.get("embedding") if isinstance(res, dict) else None
-                if not self.my_embedding and self.user_info.get("id"):
+                emb = res.get("embedding") if isinstance(res, dict) else None
+                if not emb and self.user_info.get("id"):
                     try:
                         from src.database.connection import SessionLocal
                         from src.database.models import FaceEmbedding
@@ -1269,27 +1710,20 @@ class MainWindow(QMainWindow):
                         if emb_rec and emb_rec.embedding:
                             raw_emb = emb_rec.embedding
                             if isinstance(raw_emb, str):
-                                self.my_embedding = json.loads(raw_emb)
+                                emb = json.loads(raw_emb)
                             elif isinstance(raw_emb, list):
-                                self.my_embedding = raw_emb
+                                emb = raw_emb
                         db.close()
                     except Exception as db_err:
                         logger.debug(f"Direct DB embedding fallback: {db_err}")
+                self.my_embedding = emb
                 if self.my_embedding:
                     logger.info("Successfully fetched student face embedding for local verification.")
-                else:
-                    logger.info("No face embedding registered yet for this student.")
             except Exception as e:
-                logger.debug(f"Fetch face embedding fallback: {e}")
-                self.my_embedding = None
-        
-        self.init_ui()
-        self.init_system_tray()
-        self.start_notification_socket()
-        
-        self.refresh_timer = QTimer()
-        self.refresh_timer.timeout.connect(self.auto_refresh_dashboard)
-        self.refresh_timer.start(10000)
+                logger.debug(f"Fetch face embedding background error: {e}")
+        import threading
+        t = threading.Thread(target=_fetch, daemon=True)
+        t.start()
 
     def init_system_tray(self):
         """Initializes the Windows system tray icon for background toast notifications."""
@@ -1441,6 +1875,32 @@ class MainWindow(QMainWindow):
         shortcut_btn.clicked.connect(self.handle_create_desktop_shortcut)
         sidebar_actions_box.addWidget(shortcut_btn)
 
+        # Software System Updates Button
+        update_btn = QPushButton(" Software Updates")
+        update_btn.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_ArrowUp))
+        update_btn.setIconSize(QSize(18, 18))
+        update_btn.setMinimumHeight(40)
+        update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        update_btn.setToolTip("Check for and download latest system updates or push new update URLs")
+        update_btn.setStyleSheet("""
+            QPushButton {
+                color: #e2e8f0; 
+                background-color: rgba(16, 185, 129, 0.16);
+                border: 1px solid rgba(16, 185, 129, 0.35);
+                border-radius: 8px;
+                font-weight: 600;
+                font-size: 12px;
+                padding: 0 10px;
+                text-align: left;
+            }
+            QPushButton:hover {
+                background-color: rgba(16, 185, 129, 0.35);
+                color: #ffffff;
+            }
+        """)
+        update_btn.clicked.connect(self.open_software_update_dialog)
+        sidebar_actions_box.addWidget(update_btn)
+
         # Sign Out Button
         logout_btn = QPushButton(" Sign Out")
         logout_btn.setIcon(style.standardIcon(QStyle.StandardPixmap.SP_DialogCloseButton))
@@ -1587,24 +2047,43 @@ class MainWindow(QMainWindow):
     @pyqtSlot(int, object)
     def on_page_data_loaded(self, index: int, payload: object):
         if index == 0:
-            summary = payload.get("summary", {})
-            records = payload.get("records", [])
-            self.cards["total_students"].set_animated_value(summary.get("total_students", 0))
-            self.cards["present"].set_animated_value(summary.get("present", 0))
-            self.cards["absent"].set_animated_value(summary.get("absent", 0))
-            self.cards["late"].set_animated_value(summary.get("late", 0))
-            self.cards["leave"].set_animated_value(summary.get("leave", 0))
-            self.cards["holiday"].set_animated_value(summary.get("holiday", 0))
+            if hasattr(self, "student_analytics_widget") and self.student_analytics_widget:
+                self.student_analytics_widget.load_analytics_data()
 
-            self.dashboard_table.setRowCount(0)
-            records_sorted = sorted(records, key=lambda x: x.get("check_in") or "", reverse=True)
-            for idx, r in enumerate(records_sorted[:15]):
-                self.dashboard_table.insertRow(idx)
-                self.dashboard_table.setItem(idx, 0, QTableWidgetItem(r.get("registration_number", "-")))
-                self.dashboard_table.setItem(idx, 1, QTableWidgetItem(r.get("student_name", "-")))
-                self.dashboard_table.setItem(idx, 2, QTableWidgetItem(format_12hr_time(r.get("check_in"))))
-                self.dashboard_table.setItem(idx, 3, QTableWidgetItem(r.get("status", "-")))
-                self.dashboard_table.setItem(idx, 4, QTableWidgetItem(r.get("verification_method", "-")))
+            if hasattr(self, "cards") and self.cards:
+                summary = payload.get("summary", {})
+                records = payload.get("records", [])
+                self._cached_dashboard_records = records
+                self._cached_dashboard_summary = summary
+
+                total_s = summary.get("total_students", len(records))
+                present_val = summary.get("present", 0)
+                absent_val = summary.get("absent", 0)
+                late_val = summary.get("late", 0)
+                leave_val = summary.get("leave", 0)
+                holiday_val = summary.get("holiday", 0)
+
+                if "total_students" in self.cards: self.cards["total_students"].set_animated_value(total_s)
+                if "present" in self.cards: self.cards["present"].set_animated_value(present_val)
+                if "absent" in self.cards: self.cards["absent"].set_animated_value(absent_val)
+                if "late" in self.cards: self.cards["late"].set_animated_value(late_val)
+                if "leave" in self.cards: self.cards["leave"].set_animated_value(leave_val)
+                if "holiday" in self.cards: self.cards["holiday"].set_animated_value(holiday_val)
+
+                ontime_count = summary.get("present_ontime", max(0, present_val - late_val))
+                if hasattr(self, "dashboard_filter_buttons") and self.dashboard_filter_buttons:
+                    if "all" in self.dashboard_filter_buttons:
+                        self.dashboard_filter_buttons["all"].setText(f"All Logs ({len(records)})")
+                    if "present" in self.dashboard_filter_buttons:
+                        self.dashboard_filter_buttons["present"].setText(f"Present ({ontime_count})")
+                    if "late" in self.dashboard_filter_buttons:
+                        self.dashboard_filter_buttons["late"].setText(f"Late ({late_val})")
+                    if "absent" in self.dashboard_filter_buttons:
+                        self.dashboard_filter_buttons["absent"].setText(f"Absent ({absent_val})")
+                    if "leave" in self.dashboard_filter_buttons:
+                        self.dashboard_filter_buttons["leave"].setText(f"Leave ({leave_val})")
+
+                self._render_dashboard_table()
         elif index == 2:
             while self.notice_layout.count():
                 item = self.notice_layout.takeAt(0)
@@ -1707,6 +2186,16 @@ class MainWindow(QMainWindow):
             if self.stacked_pages.currentIndex() == 0:
                 self.load_page_content(0)
 
+    def open_software_update_dialog(self):
+        try:
+            from frontend.updater import UpdateDialog
+            is_admin = self.user_info.get("role") == "admin"
+            dialog = UpdateDialog(self, is_admin=is_admin)
+            dialog.exec()
+        except Exception as e:
+            logger.error(f"Failed to open update dialog: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to open updater: {e}")
+
     def handle_logout(self):
         self.stop_camera()
         if self.notification_socket:
@@ -1754,9 +2243,46 @@ class MainWindow(QMainWindow):
     # --- Page 0: Dashboard Metrics Architecture ---
     def create_dashboard_page(self):
         page = QWidget()
+        role = str(self.user_info.get("role", "student")).lower()
+
+        if role == "student":
+            # Student Personal Attendance Heatmap & Analytics View
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(28, 20, 28, 24)
+            page_layout.setSpacing(16)
+            page.setStyleSheet("background-color: transparent;")
+
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setStyleSheet("""
+                QScrollArea {
+                    border: none;
+                    background: transparent;
+                }
+                QScrollArea > QWidget > QWidget {
+                    background: transparent;
+                }
+            """)
+
+            container = QWidget()
+            container.setStyleSheet("background: transparent;")
+            c_layout = QVBoxLayout(container)
+            c_layout.setContentsMargins(0, 0, 0, 0)
+            c_layout.setSpacing(16)
+
+            self.student_analytics_widget = StudentAttendanceAnalyticsWidget(user_info=self.user_info)
+            c_layout.addWidget(self.student_analytics_widget)
+
+            scroll.setWidget(container)
+            page_layout.addWidget(scroll)
+
+            self.stacked_pages.addWidget(page)
+            return
+
+        # Administrator / HR / Teacher Telemetry Dashboard
         layout = QVBoxLayout(page)
         layout.setContentsMargins(30, 25, 30, 30)
-        layout.setSpacing(25)
+        layout.setSpacing(22)
 
         hdr_layout = QHBoxLayout()
         hdr_label = QLabel("Daily Telemetry & Operational Metrics")
@@ -1820,49 +2346,215 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(cards_grid)
 
+        # ── Control & Filter Bar for Transaction Logs ──
+        logs_control_layout = QVBoxLayout()
+        logs_control_layout.setSpacing(10)
+
+        hdr_row = QHBoxLayout()
         lbl_section = QLabel("Real-Time Infrastructure Streams & Transaction Logs")
-        lbl_section.setStyleSheet("font-size: 14px; font-weight: 700; color: #1e3a8a;")
-        layout.addWidget(lbl_section)
+        lbl_section.setStyleSheet("font-size: 15px; font-weight: 700; color: #1e3a8a;")
+        hdr_row.addWidget(lbl_section)
+        hdr_row.addStretch()
+
+        self.dashboard_search_input = QLineEdit()
+        self.dashboard_search_input.setPlaceholderText("🔍 Search logs by student name or reg number...")
+        self.dashboard_search_input.setClearButtonEnabled(True)
+        self.dashboard_search_input.setFixedWidth(290)
+        self.dashboard_search_input.setStyleSheet("""
+            QLineEdit {
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+                padding: 6px 12px;
+                font-size: 12px;
+                color: #1e293b;
+            }
+            QLineEdit:focus {
+                border: 1px solid #3b82f6;
+            }
+        """)
+        self.dashboard_search_input.textChanged.connect(self._filter_dashboard_table)
+        hdr_row.addWidget(self.dashboard_search_input)
+        logs_control_layout.addLayout(hdr_row)
+
+        # Filter Tabs Row
+        filter_bar = QHBoxLayout()
+        filter_bar.setSpacing(8)
+        self.dashboard_filter_buttons = {}
+        self.active_dashboard_filter = "all"
+
+        filter_configs = [
+            ("All Logs", "all", "#3b82f6"),
+            ("Present", "present", "#10b981"),
+            ("Late Arrivals", "late", "#f59e0b"),
+            ("Absent Students", "absent", "#ef4444"),
+            ("On Leave", "leave", "#8b5cf6")
+        ]
+
+        for label_text, f_key, btn_color in filter_configs:
+            f_btn = QPushButton(label_text)
+            f_btn.setCheckable(True)
+            f_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            f_btn.setProperty("filter_key", f_key)
+            f_btn.setProperty("color", btn_color)
+            f_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: #f1f5f9;
+                    color: #475569;
+                    border: 1px solid #cbd5e1;
+                    border-radius: 6px;
+                    padding: 5px 14px;
+                    font-size: 12px;
+                    font-weight: 600;
+                }}
+                QPushButton:hover {{
+                    background-color: #e2e8f0;
+                    color: #1e293b;
+                }}
+                QPushButton:checked {{
+                    background-color: {btn_color};
+                    color: #ffffff;
+                    border: 1px solid {btn_color};
+                    font-weight: 700;
+                }}
+            """)
+            f_btn.clicked.connect(lambda checked=False, key=f_key: self._on_dashboard_filter_clicked(key))
+            filter_bar.addWidget(f_btn)
+            self.dashboard_filter_buttons[f_key] = f_btn
+
+        self.dashboard_filter_buttons["all"].setChecked(True)
+        filter_bar.addStretch()
+        logs_control_layout.addLayout(filter_bar)
+        layout.addLayout(logs_control_layout)
         
         self.dashboard_table = QTableWidget()
         self.dashboard_table.setColumnCount(5)
         self.dashboard_table.setHorizontalHeaderLabels(["Reg Domain", "Identity Descriptor", "Timestamp", "State Status", "Verification Core"])
         self.dashboard_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.dashboard_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.dashboard_table.setAlternatingRowColors(True)
+        self.dashboard_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #ffffff;
+                color: #1e293b;
+                gridline-color: #e2e8f0;
+                border: 1px solid #cbd5e1;
+                border-radius: 8px;
+            }
+            QHeaderView::section {
+                background-color: #f8fafc;
+                color: #1e3a8a;
+                font-weight: 700;
+                font-size: 12px;
+                padding: 8px;
+                border: none;
+                border-bottom: 2px solid #cbd5e1;
+            }
+        """)
         layout.addWidget(self.dashboard_table)
 
         self.stacked_pages.addWidget(page)
 
+    def _on_dashboard_filter_clicked(self, filter_key: str):
+        self.active_dashboard_filter = filter_key
+        for key, btn in self.dashboard_filter_buttons.items():
+            btn.setChecked(key == filter_key)
+        self._render_dashboard_table()
+
+    def _filter_dashboard_table(self, text: str):
+        self._render_dashboard_table()
+
+    def _render_dashboard_table(self):
+        """Renders the dashboard transaction logs with filter tabs and search query."""
+        if not hasattr(self, "dashboard_table") or not self._cached_dashboard_records:
+            return
+
+        query = self.dashboard_search_input.text().strip().lower() if hasattr(self, "dashboard_search_input") else ""
+        active_filter = getattr(self, "active_dashboard_filter", "all")
+
+        filtered = []
+        for r in self._cached_dashboard_records:
+            status = str(r.get("status") or "").strip().lower()
+            name = str(r.get("student_name") or "").lower()
+            reg = str(r.get("registration_number") or "").lower()
+
+            # Filter Tab Match
+            if active_filter == "present" and status != "present":
+                continue
+            elif active_filter == "late" and status != "late":
+                continue
+            elif active_filter == "absent" and status != "absent":
+                continue
+            elif active_filter == "leave" and status != "leave":
+                continue
+
+            # Search Query Match
+            if query and (query not in name and query not in reg and query not in status):
+                continue
+
+            filtered.append(r)
+
+        # Sort: check_in times first, then absent/unmarked
+        filtered_sorted = sorted(
+            filtered,
+            key=lambda x: (
+                0 if (x.get("status") or "").lower() in ["present", "late"] else 1,
+                x.get("check_in") or ""
+            ),
+            reverse=False
+        )
+
+        self.dashboard_table.setUpdatesEnabled(False)
+        self.dashboard_table.setRowCount(len(filtered_sorted))
+
+        for idx, r in enumerate(filtered_sorted):
+            self.dashboard_table.setRowHeight(idx, 38)
+            status_raw = str(r.get("status") or "-")
+            status_lower = status_raw.lower()
+
+            # Reg Domain
+            reg_item = QTableWidgetItem(r.get("registration_number", "-"))
+            reg_item.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+            self.dashboard_table.setItem(idx, 0, reg_item)
+
+            # Student Name
+            name_item = QTableWidgetItem(r.get("student_name", "-"))
+            name_item.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
+            self.dashboard_table.setItem(idx, 1, name_item)
+
+            # Timestamp
+            check_in_str = format_12hr_time(r.get("check_in"))
+            time_item = QTableWidgetItem(check_in_str if check_in_str != "-" else "—")
+            self.dashboard_table.setItem(idx, 2, time_item)
+
+            # Status with Color Highlighting
+            status_item = QTableWidgetItem(status_raw)
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if status_lower == "present":
+                status_item.setForeground(QColor("#047857"))
+                status_item.setBackground(QColor("#ecfdf5"))
+            elif status_lower == "late":
+                status_item.setForeground(QColor("#b45309"))
+                status_item.setBackground(QColor("#fffbeb"))
+            elif status_lower == "absent":
+                status_item.setForeground(QColor("#b91c1c"))
+                status_item.setBackground(QColor("#fef2f2"))
+            elif status_lower == "leave":
+                status_item.setForeground(QColor("#6b21a8"))
+                status_item.setBackground(QColor("#faf5ff"))
+            status_item.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+            self.dashboard_table.setItem(idx, 3, status_item)
+
+            # Verification Core
+            method = r.get("verification_method", "-")
+            core_item = QTableWidgetItem(method)
+            core_item.setForeground(QColor("#475569"))
+            self.dashboard_table.setItem(idx, 4, core_item)
+
+        self.dashboard_table.setUpdatesEnabled(True)
+
     def refresh_dashboard(self, show_errors=True):
-        try:
-            summary = api_client.get_summary()
-            self.cards["total_students"].set_animated_value(summary.get("total_students", 0))
-            self.cards["present"].set_animated_value(summary.get("present", 0))
-            self.cards["absent"].set_animated_value(summary.get("absent", 0))
-            self.cards["late"].set_animated_value(summary.get("late", 0))
-            self.cards["leave"].set_animated_value(summary.get("leave", 0))
-            self.cards["holiday"].set_animated_value(summary.get("holiday", 0))
-
-            if summary.get("is_holiday"):
-                self.cards["holiday"].setStyleSheet("color: #ef4444; font-weight: bold; font-size:32px;")
-            else:
-                self.cards["holiday"].setStyleSheet("color: #94a3b8; font-size:32px;")
-
-            records = api_client.get_daily_attendance()
-            self.dashboard_table.setRowCount(0)
-            records_sorted = sorted(records, key=lambda x: x.get("check_in") or "", reverse=True)
-
-            for idx, r in enumerate(records_sorted[:15]):
-                self.dashboard_table.insertRow(idx)
-                self.dashboard_table.setItem(idx, 0, QTableWidgetItem(r["registration_number"]))
-                self.dashboard_table.setItem(idx, 1, QTableWidgetItem(r["student_name"]))
-                self.dashboard_table.setItem(idx, 2, QTableWidgetItem(r["check_in"] or "-"))
-                self.dashboard_table.setItem(idx, 3, QTableWidgetItem(r["status"]))
-                self.dashboard_table.setItem(idx, 4, QTableWidgetItem(r["verification_method"]))
-        except Exception as e:
-            logger.error(f"Dashboard telemetry read error: {e}")
-            if show_errors:
-                QMessageBox.warning(self, "Pipeline Error", f"Could not sync with local database: {str(e)}")
+        self.load_page_content(0)
 
     def show_notifications(self):
         try:
@@ -2052,22 +2744,15 @@ class MainWindow(QMainWindow):
 
                 self.admin_verify_btn.setEnabled(False)
                 self.admin_verify_btn.setText("⏳  Verifying...")
-                self.admin_result_label.setText("🔍  Running face match against stored profile...")
-                QApplication.processEvents()
+                self.admin_result_label.setStyleSheet("font-size: 12px; font-weight: 600; color: #0c4a6e; background: transparent; border: none; padding: 4px 0;")
+                self.admin_result_label.setText("🔍  Running face match & anti-spoof...")
 
-                try:
-                    from frontend.onnx_face_service import onnx_face_service
-                    from frontend.utils.wifi_checker import get_current_bssid
+                def on_admin_progress(msg):
+                    self.admin_result_label.setText(msg)
 
-                    import time as _pytime
-                    frames_to_check = [self.last_frame_bytes]
-                    for _ in range(2):
-                        _pytime.sleep(0.08)
-                        QApplication.processEvents()
-                        if self.last_frame_bytes and self.last_frame_bytes not in frames_to_check:
-                            frames_to_check.append(self.last_frame_bytes)
-
-                    verify_res = onnx_face_service.verify_face_burst(frames_to_check, self._admin_target_embedding)
+                def on_admin_finished(verify_res):
+                    self.admin_verify_btn.setEnabled(True)
+                    self.admin_verify_btn.setText("✅  Verify Face & Mark Attendance")
 
                     if not verify_res.get("verified"):
                         self.admin_result_label.setStyleSheet(
@@ -2087,42 +2772,46 @@ class MainWindow(QMainWindow):
                     candidate_embedding = verify_res.get("candidate_embedding", [])
                     bssid = get_current_bssid()
 
-                    res = api_client.submit_admin_face_attendance(
-                        student_id=student["id"],
-                        confidence=confidence,
-                        bssid=bssid,
-                        candidate_embedding=candidate_embedding
-                    )
-
-                    if res.get("status") == "success":
-                        self.admin_result_label.setStyleSheet(
-                            "font-size: 12px; font-weight: 700; color: #15803d; "
-                            "background: #f0fdf4; border: 1px solid #86efac; border-radius: 8px; padding: 8px;"
-                        )
-                        self.admin_result_label.setText(res.get("message", "Attendance marked."))
-                        self.session_log_text.append(
-                            f"[{datetime.now().strftime('%H:%M:%S')}] ADMIN-VERIFY PASS: "
-                            f"{student['full_name']} ({confidence:.1f}% confidence)"
-                        )
-                    else:
-                        self.admin_result_label.setStyleSheet(
-                            "font-size: 12px; font-weight: 700; color: #dc2626; "
-                            "background: #fff1f2; border: 1px solid #fecaca; border-radius: 8px; padding: 8px;"
-                        )
-                        self.admin_result_label.setText(f"❌  {res.get('error', 'Attendance failed.')}")
-                        self.session_log_text.append(
-                            f"[{datetime.now().strftime('%H:%M:%S')}] ADMIN-VERIFY FAIL: {res.get('error')}"
+                    try:
+                        res = api_client.submit_admin_face_attendance(
+                            student_id=student["id"],
+                            confidence=confidence,
+                            bssid=bssid,
+                            candidate_embedding=candidate_embedding
                         )
 
-                except Exception as exc:
-                    self.admin_result_label.setStyleSheet(
-                        "font-size: 12px; font-weight: 700; color: #dc2626; background: transparent; border: none;"
-                    )
-                    self.admin_result_label.setText(f"⚠  Error: {exc}")
-                    logger.error(f"Admin face verify error: {exc}", exc_info=True)
-                finally:
-                    self.admin_verify_btn.setEnabled(True)
-                    self.admin_verify_btn.setText("✅  Verify Face & Mark Attendance")
+                        if res.get("status") == "success":
+                            self.admin_result_label.setStyleSheet(
+                                "font-size: 12px; font-weight: 700; color: #15803d; "
+                                "background: #f0fdf4; border: 1px solid #86efac; border-radius: 8px; padding: 8px;"
+                            )
+                            self.admin_result_label.setText(res.get("message", "Attendance marked."))
+                            self.session_log_text.append(
+                                f"[{datetime.now().strftime('%H:%M:%S')}] ADMIN-VERIFY PASS: "
+                                f"{student['full_name']} ({confidence:.1f}% confidence)"
+                            )
+                        else:
+                            self.admin_result_label.setStyleSheet(
+                                "font-size: 12px; font-weight: 700; color: #dc2626; "
+                                "background: #fff1f2; border: 1px solid #fecaca; border-radius: 8px; padding: 8px;"
+                            )
+                            err_detail = res.get('error', 'Attendance failed.')
+                            if "confidence" in res and res.get("confidence") is not None:
+                                err_detail += f" [Confidence: {res.get('confidence')}%, Dist: {res.get('distance', 'N/A')}]"
+                            self.admin_result_label.setText(f"❌  {err_detail}")
+                            self.session_log_text.append(
+                                f"[{datetime.now().strftime('%H:%M:%S')}] ADMIN-VERIFY FAIL: {err_detail}"
+                            )
+                    except Exception as exc:
+                        self.admin_result_label.setText(f"⚠  Attendance submission error: {exc}")
+
+                self._admin_worker = AsyncFaceVerifyWorker(
+                    self._admin_target_embedding,
+                    lambda: self.last_frame_bytes
+                )
+                self._admin_worker.progress_update.connect(on_admin_progress)
+                self._admin_worker.verification_finished.connect(on_admin_finished)
+                self._admin_worker.start()
 
             # Refresh students when the page is first shown and on combo click
             load_emb_btn.clicked.connect(_load_embedding)
@@ -2162,7 +2851,13 @@ class MainWindow(QMainWindow):
         # Save clean frame for face model verification
         ret, jpeg = cv2.imencode('.jpg', cv_img)
         if ret:
-            self.last_frame_bytes = jpeg.tobytes()
+            f_bytes = jpeg.tobytes()
+            self.last_frame_bytes = f_bytes
+            if not hasattr(self, "_recent_camera_frames"):
+                self._recent_camera_frames = []
+            self._recent_camera_frames.append(f_bytes)
+            if len(self._recent_camera_frames) > 12:
+                self._recent_camera_frames.pop(0)
 
         # 🔍 Auto-detect student face in camera frame anywhere
         detected_box = onnx_face_service.detect_face_box(cv_img)
@@ -2249,105 +2944,153 @@ class MainWindow(QMainWindow):
             return
 
         if not self.last_frame_bytes:
-            img = np.zeros((480, 640, 3), dtype=np.uint8)
-            ret, jpeg = cv2.imencode('.jpg', img)
-            self.last_frame_bytes = jpeg.tobytes()
+            QMessageBox.warning(
+                self,
+                "Camera Not Ready",
+                "Camera feed is not ready. Please ensure your webcam is connected and enabled."
+            )
+            return
 
-        # --- Loading indicator: disable button and show spinner text ---
-        self.face_verify_btn.setEnabled(False)
-        self.face_verify_btn.setText("⏳  Processing face model...")
-        self.verify_indicator.setStyleSheet("font-size: 14px; font-weight: 600; color: #1e3a8a; padding: 12px; background-color: #e0e7ff; border-radius: 8px; border: 1px solid #a5b4fc;")
-        self.verify_indicator.setText("🔍  Running face alignment & liveness check, please hold still...")
-        QApplication.processEvents()
-
-        try:
-            # Always fetch fresh embedding from backend/DB for the logged-in student
+        # Fetch fresh embedding if not in memory
+        if not self.my_embedding:
             try:
                 res_emb = api_client.get_my_embedding()
-                self.my_embedding = res_emb.get("embedding")
+                self.my_embedding = res_emb.get("embedding") if isinstance(res_emb, dict) else None
             except Exception as e:
                 logger.warning(f"API load student embedding ({e}), querying database directly...")
                 self.my_embedding = None
 
-            if not self.my_embedding:
-                try:
-                    from src.database.connection import SessionLocal
-                    from src.database.models import Student, FaceEmbedding
-                    import json
-                    db = SessionLocal()
-                    uname = self.user_info.get("username", "")
-                    s = db.query(Student).filter(Student.registration_number == uname).first()
-                    if not s and uname.endswith("-tipsg"):
-                        s = db.query(Student).filter(Student.registration_number == uname[:-6]).first()
-                    if not s and not uname.endswith("-tipsg"):
-                        s = db.query(Student).filter(Student.registration_number == f"{uname}-tipsg").first()
-                    if s:
-                        emb_rec = db.query(FaceEmbedding).filter(FaceEmbedding.student_id == s.id).first()
-                        if emb_rec and emb_rec.embedding:
-                            self.my_embedding = json.loads(emb_rec.embedding) if isinstance(emb_rec.embedding, str) else emb_rec.embedding
-                    db.close()
-                except Exception as db_err:
-                    logger.debug(f"DB load embedding error: {db_err}")
+        if not self.my_embedding:
+            try:
+                from src.database.connection import SessionLocal
+                from src.database.models import Student, FaceEmbedding
+                import json
+                db = SessionLocal()
+                uname = self.user_info.get("username", "")
+                s = db.query(Student).filter(Student.registration_number == uname).first()
+                if not s and uname.endswith("-tipsg"):
+                    s = db.query(Student).filter(Student.registration_number == uname[:-6]).first()
+                if not s and not uname.endswith("-tipsg"):
+                    s = db.query(Student).filter(Student.registration_number == f"{uname}-tipsg").first()
+                if s:
+                    emb_rec = db.query(FaceEmbedding).filter(FaceEmbedding.student_id == s.id).first()
+                    if emb_rec and emb_rec.embedding:
+                        self.my_embedding = json.loads(emb_rec.embedding) if isinstance(emb_rec.embedding, str) else emb_rec.embedding
+                db.close()
+            except Exception as db_err:
+                logger.debug(f"DB load embedding error: {db_err}")
 
-            if not self.my_embedding:
-                raise ValueError("No registered face embedding found for your account. Please ask admin to register your photo.")
+        if not self.my_embedding:
+            QMessageBox.critical(
+                self,
+                "No Face Profile",
+                "No registered face embedding found for your account. Please ask admin to register your photo."
+            )
+            return
 
-            from datetime import datetime, date, time, timezone, timedelta
-            _IST = timezone(timedelta(hours=5, minutes=30))
-            student_name = self.user_info.get("full_name", "Unknown")
-            logger.info(f"Starting 1-to-1 face verification for student: {student_name}")
+        # Disable button and update indicator
+        self.face_verify_btn.setEnabled(False)
+        self.face_verify_btn.setText("⏳  Verifying Face & Anti-Spoof...")
+        self.verify_indicator.setStyleSheet("font-size: 14px; font-weight: 600; color: #1e3a8a; padding: 12px; background-color: #e0e7ff; border-radius: 8px; border: 1px solid #a5b4fc;")
+        self.verify_indicator.setText("👁️  Live Anti-Spoof: Please BLINK your eyes naturally now...")
 
-            # Perform local face verification with burst evaluation (3 continuous frames)
-            from frontend.onnx_face_service import onnx_face_service
-            import time as _pytime
-            frames_to_check = [self.last_frame_bytes]
-            for _ in range(2):
-                _pytime.sleep(0.08)
-                QApplication.processEvents()
-                if self.last_frame_bytes and self.last_frame_bytes not in frames_to_check:
-                    frames_to_check.append(self.last_frame_bytes)
+        # Start non-blocking verification worker
+        self._student_verify_worker = AsyncFaceVerifyWorker(
+            self.my_embedding,
+            lambda: self.last_frame_bytes
+        )
+        self._student_verify_worker.progress_update.connect(lambda msg: self.verify_indicator.setText(msg))
+        self._student_verify_worker.verification_finished.connect(self._on_student_verification_completed)
+        self._student_verify_worker.start()
 
-            verify_res = onnx_face_service.verify_face_burst(frames_to_check, self.my_embedding)
-            
-            if not verify_res.get("verified"):
-                self.verify_indicator.setStyleSheet("color: #ffffff; font-weight: bold; background-color: #ef4444; border-radius: 12px; border: 1px solid #dc2626; padding: 12px;")
-                self.verify_indicator.setText(verify_res.get("error", "Face verification failed."))
-                self.session_log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] REJECT: {verify_res.get('error', 'Face Unrecognized')}")
-                return
+    def _on_student_verification_completed(self, verify_res: dict):
+        self.face_verify_btn.setEnabled(True)
+        self.face_verify_btn.setText("▶  Mark My Attendance")
 
-            if verify_res.get("adaptive_updated") and verify_res.get("updated_embedding"):
-                self.my_embedding = verify_res["updated_embedding"]
-                logger.info("Local student embedding adapted seamlessly.")
+        if not verify_res.get("verified"):
+            self.verify_indicator.setStyleSheet("color: #ffffff; font-weight: bold; background-color: #ef4444; border-radius: 12px; border: 1px solid #dc2626; padding: 12px;")
+            self.verify_indicator.setText(verify_res.get("error", "Face verification failed."))
+            self.session_log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] REJECT: {verify_res.get('error', 'Face Unrecognized')}")
+            return
 
-            confidence = verify_res.get("confidence", 0.0)
-            candidate_embedding = verify_res.get("candidate_embedding", [])
-            current_bssid = get_current_bssid()
+        if verify_res.get("adaptive_updated") and verify_res.get("updated_embedding"):
+            self.my_embedding = verify_res["updated_embedding"]
+            logger.info("Local student embedding adapted seamlessly.")
 
-            
-            # Submit verification score, candidate embedding, and BSSID to backend to record attendance
+        confidence = verify_res.get("confidence", 0.0)
+        candidate_embedding = verify_res.get("candidate_embedding", [])
+        current_bssid = get_current_bssid()
+
+        # Submit verification score, candidate embedding, and BSSID to backend to record attendance
+        try:
             res = api_client.submit_verified_attendance(
                 confidence=confidence,
                 bssid=current_bssid,
                 candidate_embedding=candidate_embedding
             )
-            
+
             if res.get("status") == "success":
                 self.verify_indicator.setStyleSheet("color: #ffffff; font-weight: bold; background-color: #16a34a; border-radius: 12px; border: 1px solid #15803d; padding: 12px;")
                 self.verify_indicator.setText(f"✅  {res['message']} (Confidence: {confidence:.1f}%)")
                 self.session_log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] PASS: {res.get('student_name', self.user_info.get('full_name', 'Student'))} ({confidence:.1f}% Confidence)")
                 if hasattr(self, "toast") and self.toast:
-                    self.toast.show_message(f"Attendance Recorded! ({confidence:.1f}% Match)", icon="✨", is_success=True)
+                    self.toast.show_message("✅ Attendance Marked Successfully!", icon="✨", is_success=True)
+                
+                # Refresh analytics in background
+                if hasattr(self, "student_analytics_widget") and self.student_analytics_widget:
+                    self.student_analytics_widget.load_analytics_data()
+
+                # Adaptive Face Learning (Every 3 Attendances)
+                try:
+                    from frontend.utils.adaptive_learner import record_successful_attendance_and_adapt
+                    target_student_id = self.user_info.get("id")
+                    if not target_student_id:
+                        from src.database.connection import SessionLocal
+                        from src.database.models import Student
+                        db = SessionLocal()
+                        uname = (self.user_info.get("username") or self.user_info.get("registration_number") or "").strip()
+                        st_lookup = db.query(Student).filter((Student.registration_number == uname) | (Student.email == uname)).first()
+                        if st_lookup:
+                            target_student_id = st_lookup.id
+                        db.close()
+
+                    if target_student_id and self.my_embedding and candidate_embedding:
+                        did_adapt, new_emb, prog = record_successful_attendance_and_adapt(
+                            student_id=target_student_id,
+                            stored_embedding=self.my_embedding,
+                            candidate_embedding=candidate_embedding,
+                            confidence=confidence,
+                            learning_rate=0.15
+                        )
+                        if did_adapt and new_emb:
+                            self.my_embedding = new_emb
+                            logger.info(f"✨ [AI Face Learning] Successfully adapted student face embedding after 3 attendances.")
+                            if hasattr(self, "toast") and self.toast:
+                                self.toast.show_message("✨ AI Face Model Adapted to Your Latest Appearance!", icon="👤", is_success=True)
+                except Exception as adapt_err:
+                    logger.debug(f"Adaptive learning hook error: {adapt_err}")
             else:
                 recorded_via_db = False
                 try:
+                    from datetime import timezone, timedelta, time as dtime
                     from src.database.connection import SessionLocal
                     from src.database.models import Student, Attendance, Holiday
+                    _IST = timezone(timedelta(hours=5, minutes=30))
                     today = datetime.now(_IST).date()
                     now_time = datetime.now(_IST).time()
                     
                     db = SessionLocal()
                     student_id = self.user_info.get("id")
                     st = db.query(Student).filter(Student.id == student_id).first() if student_id else None
+                    if not st and self.user_info:
+                        uname = (self.user_info.get("username") or self.user_info.get("registration_number") or "").strip()
+                        if uname:
+                            st = db.query(Student).filter(
+                                (Student.registration_number == uname) |
+                                (Student.registration_number == f"{uname}-tipsg") |
+                                (Student.email == uname)
+                            ).first()
+
                     if st:
                         is_holiday = db.query(Holiday).filter(Holiday.date == today).first() is not None
                         if is_holiday:
@@ -2359,8 +3102,8 @@ class MainWindow(QMainWindow):
                                 db.commit()
                                 msg = f"Goodbye {st.full_name}! Check-out registered."
                             else:
-                                start_time_obj = time(9, 0, 0)
-                                late_limit = time(9, 15, 0)
+                                start_time_obj = dtime(9, 0, 0)
+                                late_limit = dtime(9, 15, 0)
                                 att_status = "Present" if now_time <= late_limit else "Late"
                                 rec = Attendance(
                                     student_id=st.id,
@@ -2378,6 +3121,31 @@ class MainWindow(QMainWindow):
                             self.verify_indicator.setStyleSheet("color: #ffffff; font-weight: bold; background-color: #16a34a; border-radius: 12px; border: 1px solid #15803d; padding: 12px;")
                             self.verify_indicator.setText(f"✅  {msg} (Confidence: {confidence:.1f}%)")
                             self.session_log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] PASS: {st.full_name} ({confidence:.1f}% Confidence)")
+                            if hasattr(self, "toast") and self.toast:
+                                self.toast.show_message(f"✅ {msg}", icon="✨", is_success=True)
+
+                            # Refresh analytics in background
+                            if hasattr(self, "student_analytics_widget") and self.student_analytics_widget:
+                                self.student_analytics_widget.load_analytics_data()
+
+                            # Adaptive Face Learning (Every 3 Attendances)
+                            try:
+                                from frontend.utils.adaptive_learner import record_successful_attendance_and_adapt
+                                if st.id and self.my_embedding and candidate_embedding:
+                                    did_adapt, new_emb, prog = record_successful_attendance_and_adapt(
+                                        student_id=st.id,
+                                        stored_embedding=self.my_embedding,
+                                        candidate_embedding=candidate_embedding,
+                                        confidence=confidence,
+                                        learning_rate=0.15
+                                    )
+                                    if did_adapt and new_emb:
+                                        self.my_embedding = new_emb
+                                        logger.info(f"✨ [AI Face Learning] Successfully adapted student face embedding after 3 attendances.")
+                                        if hasattr(self, "toast") and self.toast:
+                                            self.toast.show_message("✨ AI Face Model Adapted to Your Latest Appearance!", icon="👤", is_success=True)
+                            except Exception as adapt_err:
+                                logger.debug(f"Adaptive learning hook error: {adapt_err}")
                     db.close()
                 except Exception as db_err:
                     logger.debug(f"Direct DB attendance fallback error: {db_err}")
@@ -2387,18 +3155,9 @@ class MainWindow(QMainWindow):
                     self.verify_indicator.setText(res.get("error", "Attendance registration failed."))
                     self.session_log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] REJECT: {res.get('error', 'Attendance failed')}")
         except Exception as e:
-            import traceback
-            print("\n========== ATTENDANCE ERROR ==========")
-            print("Error:", str(e))
-            traceback.print_exc()
-            print("=====================================\n")
+            logger.error(f"Attendance verification handler error: {e}", exc_info=True)
             self.verify_indicator.setStyleSheet("color: #ef4444; font-weight: bold; background-color: #fff1f2; border-radius: 8px; border: 1px solid #fecaca; padding: 12px;")
             self.verify_indicator.setText(f"⚠  ERROR: {str(e)}")
-            QMessageBox.critical(self, "Attendance Error", str(e))
-        finally:
-            # Always restore the button regardless of success or failure
-            self.face_verify_btn.setEnabled(True)
-            self.face_verify_btn.setText("▶  Mark My Attendance")
 
     # --- Page 2: Broadcast Notice Board ---
     def create_noticeboard_page(self):
@@ -2468,6 +3227,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to execute absence scan: {e}")
 
     # --- Page 3: Student Directory Layout ---
+    # --- Page 3: Student Directory Layout ---
     def create_students_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -2499,7 +3259,7 @@ class MainWindow(QMainWindow):
         search_icon = QLabel("🔍")
         search_icon.setStyleSheet("font-size: 14px;")
         self.student_search_input = QLineEdit()
-        self.student_search_input.setPlaceholderText("Search students by name, registration number, course, email, parent phone...")
+        self.student_search_input.setPlaceholderText("Search students by name, registration number, course, phone, email, parent details...")
         self.student_search_input.setClearButtonEnabled(True)
         self.student_search_input.textChanged.connect(self.filter_students_table)
 
@@ -2507,100 +3267,181 @@ class MainWindow(QMainWindow):
         search_layout.addWidget(self.student_search_input)
         layout.addWidget(search_card)
 
-        # Table Widget with Neumorphic Styling & Fixed Actions Column Width
+        # Table Widget with Neumorphic Styling & Responsive Columns
         self.students_table = QTableWidget()
-        self.students_table.setColumnCount(8)
+        self.students_table.setColumnCount(10)
         self.students_table.setHorizontalHeaderLabels([
-            "Reg. Number", "Full Name", "Course",
-            "Student Email", "Parent Name", "Parent Phone", "Parent Email",
-            "Actions"
+            "Reg. No.", "Student Name", "Course",
+            "Student Phone", "Student Email", "Parent / Guardian",
+            "Parent Phone", "Parent Email", "Status", "Actions"
         ])
         
         header = self.students_table.horizontalHeader()
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
-        self.students_table.setColumnWidth(7, 130)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(9, QHeaderView.ResizeMode.Fixed)
+        self.students_table.setColumnWidth(1, 150)
+        self.students_table.setColumnWidth(4, 160)
+        self.students_table.setColumnWidth(5, 140)
+        self.students_table.setColumnWidth(7, 160)
+        self.students_table.setColumnWidth(9, 185)
 
         self.students_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.students_table.setAlternatingRowColors(True)
         self.students_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.students_table.cellDoubleClicked.connect(self._on_student_table_double_clicked)
         layout.addWidget(self.students_table)
 
         self.stacked_pages.addWidget(page)
 
     def _populate_students_table(self, students: list):
         self._cached_students_list = students
+        self.students_table.setUpdatesEnabled(False)
         self.students_table.setRowCount(0)
         is_admin = self.user_info.get("role") == "admin"
         
         for idx, s in enumerate(students):
             self.students_table.insertRow(idx)
-            self.students_table.setItem(idx, 0, QTableWidgetItem(s.get("registration_number", "-")))
-            self.students_table.setItem(idx, 1, QTableWidgetItem(s.get("full_name", "-")))
+            self.students_table.setRowHeight(idx, 48)
+
+            # 0: Reg Number
+            reg_item = QTableWidgetItem(s.get("registration_number", "-"))
+            reg_item.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+            self.students_table.setItem(idx, 0, reg_item)
+
+            # 1: Full Name
+            name_item = QTableWidgetItem(s.get("full_name", "-"))
+            name_item.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
+            self.students_table.setItem(idx, 1, name_item)
+
+            # 2: Course
             self.students_table.setItem(idx, 2, QTableWidgetItem(s.get("class_name", "-")))
 
-            student_email = s.get("email") or ""
+            # 3: Student Phone (fallback to parent phone if student mobile not explicitly entered)
+            raw_phone = s.get("phone")
+            raw_parent_phone = s.get("parent_phone")
+            s_phone = str(raw_phone).strip() if raw_phone and str(raw_phone).strip() not in ["None", "—", ""] else ""
+            p_phone = str(raw_parent_phone).strip() if raw_parent_phone and str(raw_parent_phone).strip() not in ["None", "—", ""] else ""
+
+            display_phone = s_phone or p_phone or "—"
+            phone_item = QTableWidgetItem(display_phone)
+            phone_item.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+            if not s_phone and p_phone:
+                phone_item.setToolTip(f"Primary Guardian Contact: {p_phone}")
+            self.students_table.setItem(idx, 3, phone_item)
+
+            # 4: Student Email
+            student_email = s.get("email") or s.get("parent_email") or ""
             email_item = QTableWidgetItem(student_email if student_email else "No email")
             if not student_email or "@" not in student_email:
                 email_item.setForeground(QColor("#9ca3af"))
                 email_item.setToolTip("No student email registered")
-            self.students_table.setItem(idx, 3, email_item)
+            self.students_table.setItem(idx, 4, email_item)
 
-            self.students_table.setItem(idx, 4, QTableWidgetItem(s.get("parent_name", "-")))
-            self.students_table.setItem(idx, 5, QTableWidgetItem(s.get("parent_phone", "-")))
+            # 5: Parent Name
+            self.students_table.setItem(idx, 5, QTableWidgetItem(s.get("parent_name", "-")))
 
-            parent_email = s.get("parent_email") or ""
+            # 6: Parent Phone
+            parent_display_phone = p_phone or s_phone or "—"
+            self.students_table.setItem(idx, 6, QTableWidgetItem(parent_display_phone))
+
+            # 7: Parent Email
+            parent_email = s.get("parent_email") or s.get("email") or ""
             pemail_item = QTableWidgetItem(parent_email if parent_email else "No email")
             if not parent_email or "@" not in parent_email:
                 pemail_item.setForeground(QColor("#9ca3af"))
                 pemail_item.setToolTip("No parent email registered")
-            self.students_table.setItem(idx, 6, pemail_item)
+            self.students_table.setItem(idx, 7, pemail_item)
 
-            self.students_table.setRowHeight(idx, 46)
+            # 8: Account Status Badge
+            is_active = s.get("is_active", True)
+            status_item = QTableWidgetItem("Active" if is_active else "Inactive")
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            status_item.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+            if is_active:
+                status_item.setForeground(QColor("#047857"))
+                status_item.setBackground(QColor("#ecfdf5"))
+            else:
+                status_item.setForeground(QColor("#64748b"))
+                status_item.setBackground(QColor("#f1f5f9"))
+            self.students_table.setItem(idx, 8, status_item)
+
+            # 9: Actions Widget (👁️ View Details + 🗑️ Remove)
+            btn_widget = QWidget()
+            btn_layout = QHBoxLayout(btn_widget)
+            btn_layout.setContentsMargins(4, 0, 4, 0)
+            btn_layout.setSpacing(6)
+            btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            details_btn = QPushButton("👁️ Details")
+            details_btn.setFixedSize(76, 30)
+            details_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            details_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #dbeafe;
+                    color: #1e40af;
+                    border: 1px solid #bfdbfe;
+                    border-radius: 6px;
+                    font-weight: 700;
+                    font-size: 11px;
+                }
+                QPushButton:hover {
+                    background-color: #bfdbfe;
+                    color: #1e3a8a;
+                }
+            """)
+            details_btn.clicked.connect(lambda checked=False, st=s: self.open_student_details(st))
+            btn_layout.addWidget(details_btn)
+
             if is_admin:
                 del_btn = QPushButton("🗑️ Remove")
-                del_btn.setFixedSize(100, 32)
+                del_btn.setFixedSize(76, 30)
                 del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 del_btn.setStyleSheet("""
                     QPushButton {
-                        background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ef4444, stop:1 #dc2626);
-                        color: #ffffff;
-                        border: 1px solid #f87171;
-                        border-bottom: 2px solid #b91c1c;
-                        border-radius: 7px;
+                        background-color: #fee2e2;
+                        color: #dc2626;
+                        border: 1px solid #fecaca;
+                        border-radius: 6px;
                         font-weight: 700;
                         font-size: 11px;
                     }
                     QPushButton:hover {
-                        background: #dc2626;
-                    }
-                    QPushButton:pressed {
-                        border-top: 2px solid #991b1b;
-                        background: #b91c1c;
+                        background-color: #fca5a5;
+                        color: #991b1b;
                     }
                 """)
                 del_btn.clicked.connect(lambda checked=False, sid=s.get("id"): self.handle_delete_student(sid))
-
-                btn_widget = QWidget()
-                btn_layout = QHBoxLayout(btn_widget)
-                btn_layout.setContentsMargins(0, 0, 0, 0)
-                btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 btn_layout.addWidget(del_btn)
-                self.students_table.setCellWidget(idx, 7, btn_widget)
-            else:
-                self.students_table.setItem(idx, 7, QTableWidgetItem("-"))
+
+            self.students_table.setCellWidget(idx, 9, btn_widget)
+
+        self.students_table.setUpdatesEnabled(True)
+
+    def _on_student_table_double_clicked(self, row: int, col: int):
+        if hasattr(self, "_cached_students_list") and 0 <= row < len(self._cached_students_list):
+            self.open_student_details(self._cached_students_list[row])
+
+    def open_student_details(self, student: dict):
+        if not student:
+            return
+        is_admin = self.user_info.get("role") == "admin"
+        dialog = StudentDetailsDialog(student, self, is_admin=is_admin, on_delete=self.handle_delete_student)
+        dialog.exec()
 
     def filter_students_table(self, query: str):
         q = query.strip().lower()
         for row in range(self.students_table.rowCount()):
             match = False
-            for col in range(7):
+            for col in range(9):
                 item = self.students_table.item(row, col)
                 if item and q in item.text().lower():
                     match = True
@@ -2645,10 +3486,13 @@ class MainWindow(QMainWindow):
         name_input = QLineEdit()
         course_combo = QComboBox()
         course_combo.addItems(["Data Science", "Cyber security", "AI/ML Engineer", "Software Developer", "Digital Market"])
+        student_phone_input = QLineEdit()
+        student_phone_input.setPlaceholderText("Student Mobile (optional)")
         student_email_input = QLineEdit()
         student_email_input.setPlaceholderText("student@example.com")
         parent_name_input = QLineEdit()
         parent_phone_input = QLineEdit()
+        parent_phone_input.setPlaceholderText("Primary Contact / Guardian Phone")
         parent_email_input = QLineEdit()
         
         photo_layout = QHBoxLayout()
@@ -2688,6 +3532,7 @@ class MainWindow(QMainWindow):
         form_layout.addRow("Student Username:", username_layout)
         form_layout.addRow("Full Name:", name_input)
         form_layout.addRow("Course:", course_combo)
+        form_layout.addRow("Student Phone:", student_phone_input)
         form_layout.addRow("Student Email:", student_email_input)
         form_layout.addRow("Parent Name:", parent_name_input)
         form_layout.addRow("Parent Phone:", parent_phone_input)
@@ -2707,7 +3552,7 @@ class MainWindow(QMainWindow):
         submit_btn.setStyleSheet("QPushButton.PrimaryBtn")
         
         def handle_submit():
-            if not all([reg_input.text(), name_input.text(), student_email_input.text(), parent_name_input.text(), parent_phone_input.text(), parent_email_input.text(), photo_label.text(), password_input.text(), confirm_password_input.text()]):
+            if not all([reg_input.text(), name_input.text(), student_email_input.text(), parent_name_input.text(), parent_phone_input.text(), photo_label.text(), password_input.text(), confirm_password_input.text()]):
                 QMessageBox.warning(dialog, "Warning", "Please completely resolve form requirements.")
                 return
             if password_input.text() != confirm_password_input.text():
@@ -2779,6 +3624,7 @@ class MainWindow(QMainWindow):
                 "registration_number": reg_input.text().strip(),
                 "full_name": name_input.text().strip(),
                 "class_name": course_combo.currentText(),
+                "phone": student_phone_input.text().strip() or parent_phone_input.text().strip(),
                 "email": student_email_input.text().strip(),
                 "parent_name": parent_name_input.text().strip(),
                 "parent_phone": parent_phone_input.text().strip(),
@@ -3495,9 +4341,6 @@ class MainWindow(QMainWindow):
         """)
         refresh_archives_btn.clicked.connect(self.load_monthly_report_archives)
         layout.addWidget(refresh_archives_btn)
-
-        if self.user_info.get("role") in ["admin", "teacher", "hr", "manager"]:
-            self.load_monthly_report_archives()
         
         layout.addStretch()
         self.stacked_pages.addWidget(page)

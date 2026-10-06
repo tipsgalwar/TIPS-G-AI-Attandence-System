@@ -21,17 +21,30 @@ def get_monthly_report_archives(
     current_user = Depends(require_teacher)
 ):
     """Lists monthly report files generated automatically by the server."""
+    # Order so archives with actual recorded rows come first
     records = db.query(MonthlyReportArchive).order_by(
-        MonthlyReportArchive.year.desc(), MonthlyReportArchive.month.desc()
+        MonthlyReportArchive.year.desc(),
+        MonthlyReportArchive.month.desc(),
+        MonthlyReportArchive.attendance_rows_archived.desc(),
+        MonthlyReportArchive.id.desc()
     ).all()
-    return [{
-        "id": report.id,
-        "year": report.year,
-        "month": report.month,
-        "report_type": report.report_type,
-        "attendance_rows_archived": report.attendance_rows_archived,
-        "created_at": report.created_at.isoformat(),
-    } for report in records]
+
+    seen = set()
+    result = []
+    for report in records:
+        key = (report.year, report.month, report.report_type)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append({
+            "id": report.id,
+            "year": report.year,
+            "month": report.month,
+            "report_type": report.report_type,
+            "attendance_rows_archived": report.attendance_rows_archived,
+            "created_at": report.created_at.isoformat(),
+        })
+    return result
 
 @router.get("/archives/{archive_id}/download")
 def download_monthly_report_archive(
@@ -43,10 +56,44 @@ def download_monthly_report_archive(
     report = db.query(MonthlyReportArchive).filter(MonthlyReportArchive.id == archive_id).first()
     if not report:
         raise HTTPException(status_code=404, detail="Monthly report archive not found")
-    if not os.path.isfile(report.file_path):
+
+    resolved_path = None
+    # 1. Check direct path from DB
+    if report.file_path and os.path.isfile(report.file_path) and os.path.getsize(report.file_path) > 1000:
+        resolved_path = report.file_path
+    else:
+        # 2. Check candidate local directories for the report file
+        candidate_paths = [
+            Path(settings.system.get("storage_dir", "storage")) / "reports" / f"student_monthly_{report.year}_{report.month:02d}.xlsx",
+            Path("storage/reports") / f"student_monthly_{report.year}_{report.month:02d}.xlsx",
+            Path("backend/storage/reports") / f"student_monthly_{report.year}_{report.month:02d}.xlsx",
+        ]
+        for cp in candidate_paths:
+            if cp.exists() and cp.stat().st_size > 1000:
+                resolved_path = str(cp.resolve())
+                report.file_path = resolved_path
+                db.commit()
+                break
+
+    # 3. If still missing, dynamically generate from database if records exist
+    if not resolved_path:
+        report_data = report_service.get_student_monthly_data(db, report.year, report.month)
+        if report_data:
+            excel_bytes = report_service.generate_excel(report_data, "Student Monthly Attendance Report").getvalue()
+            dest_dir = Path(settings.system.get("storage_dir", "storage")) / "reports"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_file = dest_dir / f"student_monthly_{report.year}_{report.month:02d}.xlsx"
+            with open(dest_file, "wb") as f:
+                f.write(excel_bytes)
+            resolved_path = str(dest_file.resolve())
+            report.file_path = resolved_path
+            db.commit()
+
+    if not resolved_path or not os.path.isfile(resolved_path):
         raise HTTPException(status_code=404, detail="The saved report file is no longer available on this server")
+
     return FileResponse(
-        report.file_path,
+        resolved_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=f"student_monthly_{report.year}_{report.month:02d}.xlsx"
     )

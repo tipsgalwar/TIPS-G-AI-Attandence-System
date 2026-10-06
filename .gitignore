@@ -108,3 +108,12 @@ dist_installer/
 *.token
 student_session.token
 
+# Local runtime state & device data
+config/adaptive_face_state.json
+backend/config/adaptive_face_state.json
+config/device_bindings.json
+backend/config/device_bindings.json
+storage/reports/*.xlsx
+storage/reports/*.pdf
+backend/storage/
+

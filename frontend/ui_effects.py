@@ -32,25 +32,31 @@ class AmbientWaveBackground(QWidget):
         self._phase = 0.0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._animate)
-        self._timer.start(40)  # ~25 FPS ambient
+        self._timer.start(500)  # Ultra-low overhead 2 FPS ambient loop for zero CPU usage
 
     def _animate(self):
-        self._phase = (self._phase + 0.03) % (2 * math.pi)
+        if not self.isVisible():
+            return
+        self._phase = (self._phase + 0.04) % (2 * math.pi)
         self.update()
 
     def paintEvent(self, event):
+        if not self.isVisible():
+            return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         w = self.width()
         h = self.height()
+        if w <= 0 or h <= 0:
+            return
 
         # Dynamic floating ambient light orbs
         orb1_x = int(w * 0.2 + w * 0.1 * math.sin(self._phase))
         orb1_y = int(h * 0.3 + h * 0.08 * math.cos(self._phase))
         
         grad1 = QRadialGradient(orb1_x, orb1_y, int(w * 0.35))
-        grad1.setColorAt(0.0, QColor(59, 130, 246, 22))
+        grad1.setColorAt(0.0, QColor(59, 130, 246, 20))
         grad1.setColorAt(1.0, QColor(59, 130, 246, 0))
         painter.fillRect(self.rect(), QBrush(grad1))
 
@@ -58,9 +64,10 @@ class AmbientWaveBackground(QWidget):
         orb2_y = int(h * 0.7 - h * 0.08 * math.sin(self._phase * 0.8))
         
         grad2 = QRadialGradient(orb2_x, orb2_y, int(w * 0.4))
-        grad2.setColorAt(0.0, QColor(14, 165, 233, 18))
+        grad2.setColorAt(0.0, QColor(14, 165, 233, 16))
         grad2.setColorAt(1.0, QColor(14, 165, 233, 0))
         painter.fillRect(self.rect(), QBrush(grad2))
+
 
 
 class AnimatedStackedWidget(QStackedWidget):

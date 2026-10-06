@@ -340,11 +340,14 @@ def delete_leave_document_if_final(leave_req: LeaveRequest):
 @router.post("/{leave_id}/approve", response_model=LeaveRequestOut)
 def approve_leave(
     leave_id: int,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user_data: dict = Depends(get_current_user)
 ):
-    """Progresses the leave request through the approval pipeline or completes it."""
+    """
+    Progresses the leave request in the workflow.
+    - Student: Pending (Step 1) -> FacultyApproved (Step 2) -> Approved (Step 3, marks Attendance table).
+    - Staff: Pending (Step 1) -> ManagerApproved (Step 2) -> Approved (Step 3).
+    """
     user_role = current_user_data["role"]
     if user_role == "student":
         raise HTTPException(status_code=403, detail="Students are not allowed to approve leave requests.")
@@ -353,11 +356,24 @@ def approve_leave(
     if not leave_req:
         raise HTTPException(status_code=404, detail="Leave request not found")
 
-    if leave_req.status in ["Approved", "Rejected"]:
-        raise HTTPException(status_code=400, detail=f"Cannot approve request with terminal status: {leave_req.status}")
-
-    # Logic for Student Leave: 1 step (Faculty -> Approved)
     if leave_req.applicant_type == "student":
+        # Workflow: Faculty (teacher) approves Step 1 -> Admin approves Step 2
+        if leave_req.status == "Pending" and user_role in ["teacher", "admin"]:
+            leave_req.status = "FacultyApproved"
+            leave_req.approval_step = 2
+        elif leave_req.status == "FacultyApproved" and user_role == "admin":
+            leave_req.status = "Approved"
+            leave_req.approval_step = 3
+            # Automark student absent days as "Leave" in attendance table
+            apply_leave_attendance_records(db, leave_req.student_id, leave_req.start_date, leave_req.end_date)
+        elif leave_req.status == "Pending" and user_role == "admin":
+            # Admin can bypass and approve directly
+            leave_req.status = "Approved"
+            leave_req.approval_step = 3
+            apply_leave_attendance_records(db, leave_req.student_id, leave_req.start_date, leave_req.end_date)
+        else:
+            raise HTTPException(status_code=400, detail="Unauthorized approval action for student leave workflow")
+
         leave_req.status = "Approved"
         leave_req.approval_step = 2
         apply_leave_attendance_records(db, leave_req.student_id, leave_req.start_date, leave_req.end_date)
